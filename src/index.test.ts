@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import net from "node:net";
 import { createKeygenProxyServer } from "./index";
 
-type TestEnv = Parameters<typeof createKeygenProxyServer>[0];
+type TestEnv = NonNullable<Parameters<typeof createKeygenProxyServer>[0]>;
 
 type CapturedRequest = {
   method: string;
@@ -23,14 +23,10 @@ function baseEnv(overrides: Partial<TestEnv> = {}): TestEnv {
   return {
     port: 0,
     keygenAccount: "acct_123",
-    keygenProduct: "prod_123",
     keygenOrigin: "http://127.0.0.1:9",
     forwardClientHost: false,
     trustProxy: false,
     logLevel: "error",
-    validTtlMs: 86_400_000,
-    invalidTtlMs: 300_000,
-    graceMs: 259_200_000,
     ipLimit: { max: 20, windowMs: 60_000 },
     keyLimit: { max: 20, windowMs: 600_000 },
     fpLimit: { max: 20, windowMs: 600_000 },
@@ -62,12 +58,13 @@ async function startMockKeygen() {
     async fetch(req) {
       const url = new URL(req.url);
       const raw = await req.text();
-      requests.push({
+      const captured = {
         method: req.method,
         pathname: url.pathname,
         authorization: req.headers.get("authorization"),
         body: raw ? JSON.parse(raw) : null
-      });
+      };
+      requests.push(captured);
 
       return Response.json(
         { meta: { valid: true } },
@@ -265,17 +262,17 @@ describe("client IP handling", () => {
         fpLimit: { max: 20, windowMs: 600_000 }
       })
     );
-    const url = `http://127.0.0.1:${proxy.port}/license/validate`;
+    const url = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
 
     const first = await fetch(url, {
       method: "POST",
       headers: { "x-forwarded-for": "198.51.100.1" },
-      body: JSON.stringify({ licenseKey: "LICENSE-1234", fingerprint: "FINGERPRINT-1234" })
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234")
     });
     const second = await fetch(url, {
       method: "POST",
       headers: { "x-forwarded-for": "198.51.100.2" },
-      body: JSON.stringify({ licenseKey: "LICENSE-5678", fingerprint: "FINGERPRINT-5678" })
+      body: validationBody("LICENSE-5678", "FINGERPRINT-5678")
     });
 
     expect(first.status).toBe(200);
@@ -294,17 +291,17 @@ describe("client IP handling", () => {
         fpLimit: { max: 20, windowMs: 600_000 }
       })
     );
-    const url = `http://127.0.0.1:${proxy.port}/license/validate`;
+    const url = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
 
     const first = await fetch(url, {
       method: "POST",
       headers: { "x-forwarded-for": "198.51.100.1" },
-      body: JSON.stringify({ licenseKey: "LICENSE-1234", fingerprint: "FINGERPRINT-1234" })
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234")
     });
     const second = await fetch(url, {
       method: "POST",
       headers: { "x-forwarded-for": "198.51.100.2" },
-      body: JSON.stringify({ licenseKey: "LICENSE-5678", fingerprint: "FINGERPRINT-5678" })
+      body: validationBody("LICENSE-5678", "FINGERPRINT-5678")
     });
 
     expect(first.status).toBe(200);

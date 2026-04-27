@@ -2,16 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 
-type CachedValidation = {
-  ok: boolean;
-  status: number;
-  body: unknown;
-  keygenHeaders?: Record<string, string>;
-  cachedAt: number;
-  expiresAt: number;
-  graceUntil?: number;
-};
-
 type RateWindow = {
   count: number;
   resetAt: number;
@@ -29,25 +19,19 @@ type LogLevel = "debug" | "info" | "warn" | "error";
 type AppEnv = {
   port: number;
   keygenAccount: string;
-  keygenProduct?: string;
   keygenOrigin: string;
   forwardClientHost: boolean;
   trustProxy: boolean;
   logLevel: LogLevel;
-  validTtlMs: number;
-  invalidTtlMs: number;
-  graceMs: number;
   ipLimit: { max: number; windowMs: number };
   keyLimit: { max: number; windowMs: number };
   fpLimit: { max: number; windowMs: number };
 };
 
 type AppState = {
-  cache: Map<string, CachedValidation>;
   ipWindow: Map<string, RateWindow>;
   keyWindow: Map<string, RateWindow>;
   fpWindow: Map<string, RateWindow>;
-  inflight: Map<string, Promise<Response>>;
 };
 
 type ValidationPayload = {
@@ -68,14 +52,10 @@ function parseEnv(source: BunEnv = Bun.env): AppEnv {
   const env = {
     port: Number(source.PORT ?? 3000),
     keygenAccount: source.KEYGEN_ACCOUNT,
-    keygenProduct: source.KEYGEN_PRODUCT,
     keygenOrigin: source.KEYGEN_ORIGIN ?? "https://api.keygen.sh",
     forwardClientHost: source.KEYGEN_FORWARD_CLIENT_HOST === "true",
     trustProxy: source.TRUST_PROXY === "true",
     logLevel: (source.LOG_LEVEL ?? "info").toLowerCase() as LogLevel,
-    validTtlMs: Number(source.CACHE_VALID_TTL_MS ?? 24 * 60 * 60 * 1000),
-    invalidTtlMs: Number(source.CACHE_INVALID_TTL_MS ?? 5 * 60 * 1000),
-    graceMs: Number(source.CACHE_GRACE_MS ?? 3 * 24 * 60 * 60 * 1000),
     ipLimit: { max: Number(source.RL_IP_MAX ?? 20), windowMs: 60_000 },
     keyLimit: { max: Number(source.RL_KEY_MAX ?? 1), windowMs: Number(source.RL_KEY_WINDOW_MS ?? 10 * 60_000) },
     fpLimit: { max: Number(source.RL_FP_MAX ?? 1), windowMs: Number(source.RL_FP_WINDOW_MS ?? 10 * 60_000) }
@@ -90,11 +70,9 @@ function parseEnv(source: BunEnv = Bun.env): AppEnv {
 
 function createState(): AppState {
   return {
-    cache: new Map<string, CachedValidation>(),
     ipWindow: new Map<string, RateWindow>(),
     keyWindow: new Map<string, RateWindow>(),
-    fpWindow: new Map<string, RateWindow>(),
-    inflight: new Map<string, Promise<Response>>()
+    fpWindow: new Map<string, RateWindow>()
   };
 }
 
@@ -193,11 +171,10 @@ function isValidationPayloadUsable(payload: ValidationPayload): boolean {
   return payload.licenseKey.length >= 8 && payload.fingerprint.length >= 8;
 }
 
-function cacheKeyFor(env: AppEnv, payload: ValidationPayload): { cacheKey: string; licenseHash: string; fpHash: string } {
+function validationHashesFor(payload: ValidationPayload): { licenseHash: string; fpHash: string } {
   const licenseHash = sha256(payload.licenseKey);
   const fpHash = sha256(payload.fingerprint);
-  const cacheKey = `license_validation:${licenseHash}:${fpHash}:${env.keygenProduct ?? "*"}`;
-  return { cacheKey, licenseHash, fpHash };
+  return { licenseHash, fpHash };
 }
 
 function isAllowedKeygenValidationProxyPath(pathname: string, env: AppEnv): boolean {
@@ -227,63 +204,6 @@ function parseBasicLicenseAuthorization(header: string | null): string | null {
   } catch {
     return null;
   }
-}
-
-async function callKeygen(env: AppEnv, licenseKey: string, fingerprint: string): Promise<CachedValidation> {
-  const endpoint = `${env.keygenOrigin}/v1/accounts/${env.keygenAccount}/licenses/actions/validate-key`;
-  const start = Date.now();
-
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      accept: "application/vnd.api+json",
-      "content-type": "application/vnd.api+json"
-    },
-    body: JSON.stringify({
-      meta: {
-        key: licenseKey,
-        scope: {
-          fingerprint,
-          product: env.keygenProduct
-        }
-      }
-    })
-  });
-
-  const textBody = await response.text();
-  const parsedBody = readJsonSafe(textBody) ?? { raw: textBody };
-  const now = Date.now();
-  const ok = response.ok;
-  log(env, ok ? "info" : "warn", "keygen.validation.response", {
-    status: response.status,
-    ok,
-    durationMs: Date.now() - start,
-    bodyBytes: Buffer.byteLength(textBody)
-  });
-
-  return {
-    ok,
-    status: response.status,
-    body: parsedBody,
-    keygenHeaders: {
-      "Keygen-Signature": response.headers.get("Keygen-Signature") ?? "",
-      Digest: response.headers.get("Digest") ?? "",
-      Date: response.headers.get("Date") ?? ""
-    },
-    cachedAt: now,
-    expiresAt: now + (ok ? env.validTtlMs : env.invalidTtlMs),
-    graceUntil: ok ? now + env.validTtlMs + env.graceMs : undefined
-  };
-}
-
-function getCached(state: AppState, key: string): CachedValidation | undefined {
-  const entry = state.cache.get(key);
-  if (!entry) return undefined;
-  if (entry.graceUntil && entry.graceUntil < Date.now()) {
-    state.cache.delete(key);
-    return undefined;
-  }
-  return entry;
 }
 
 function isKeygenApiPath(pathname: string): boolean {
@@ -480,7 +400,7 @@ async function proxyKeygenApi(req: Request, env: AppEnv, state: AppState): Promi
       signed: Boolean(upstream.headers.get("keygen-signature"))
     });
 
-    return new Response(upstream.body, {
+    return new Response(new Uint8Array(upstream.body), {
       status: upstream.status,
       statusText: upstream.statusText,
       headers: copyResponseHeaders(upstream)
@@ -511,7 +431,7 @@ async function proxyKeygenApi(req: Request, env: AppEnv, state: AppState): Promi
   }
 
   const ip = getIp(req, env);
-  const { licenseHash, fpHash } = cacheKeyFor(env, payload);
+  const { licenseHash, fpHash } = validationHashesFor(payload);
   const isAllowed =
     withinLimit(state.ipWindow, ip, env.ipLimit.max, env.ipLimit.windowMs) &&
     withinLimit(state.keyWindow, licenseHash, env.keyLimit.max, env.keyLimit.windowMs) &&
@@ -569,7 +489,7 @@ async function proxyKeygenApi(req: Request, env: AppEnv, state: AppState): Promi
     signed: Boolean(upstream.headers.get("keygen-signature"))
   });
 
-  return new Response(upstream.body, {
+  return new Response(new Uint8Array(upstream.body), {
     status: upstream.status,
     statusText: upstream.statusText,
     headers: copyResponseHeaders(upstream)
@@ -586,158 +506,6 @@ export function createKeygenProxyServer(env: AppEnv = parseEnv(), state: AppStat
           method: req.method
         });
         return json(200, { ok: true });
-      },
-      "/license/validate": async (req) => {
-        const requestId = getRequestId(req);
-        const start = Date.now();
-
-        if (req.method !== "POST") {
-          log(env, "warn", "license.validation.method_not_allowed", {
-            requestId,
-            method: req.method
-          });
-          return json(405, { error: "method_not_allowed" });
-        }
-
-        const ip = getIp(req, env);
-        const raw = await req.text();
-        const parsed = parseValidationPayload(raw);
-
-        log(env, "info", "license.validation.request", {
-          requestId,
-          ip,
-          bodyBytes: Buffer.byteLength(raw)
-        });
-
-        if (!parsed) {
-          log(env, "warn", "license.validation.bad_request", {
-            requestId,
-            reason: "missing_license_or_fingerprint",
-            durationMs: Date.now() - start
-          });
-          return json(400, { error: "licenseKey and fingerprint are required" });
-        }
-
-        if (!isValidationPayloadUsable(parsed)) {
-          log(env, "warn", "license.validation.bad_request", {
-            requestId,
-            reason: "license_or_fingerprint_too_short",
-            licenseLength: parsed.licenseKey.length,
-            fingerprintLength: parsed.fingerprint.length,
-            durationMs: Date.now() - start
-          });
-          return json(400, { error: "licenseKey/fingerprint too short" });
-        }
-
-        const { cacheKey, licenseHash, fpHash } = cacheKeyFor(env, parsed);
-
-        const isAllowed =
-          withinLimit(state.ipWindow, ip, env.ipLimit.max, env.ipLimit.windowMs) &&
-          withinLimit(state.keyWindow, licenseHash, env.keyLimit.max, env.keyLimit.windowMs) &&
-          withinLimit(state.fpWindow, fpHash, env.fpLimit.max, env.fpLimit.windowMs);
-
-        const cached = getCached(state, cacheKey);
-        if (!isAllowed) {
-          if (cached?.ok && cached.graceUntil && cached.graceUntil > Date.now()) {
-            log(env, "warn", "license.validation.rate_limited_grace", {
-              requestId,
-              ip,
-              licenseHash: shortHash(licenseHash),
-              fingerprintHash: shortHash(fpHash),
-              durationMs: Date.now() - start
-            });
-            return json(200, { ...cached, source: "cache-grace" }, { "x-proxy-cache": "grace" });
-          }
-          log(env, "warn", "license.validation.rate_limited", {
-            requestId,
-            ip,
-            licenseHash: shortHash(licenseHash),
-            fingerprintHash: shortHash(fpHash),
-            durationMs: Date.now() - start
-          });
-          return json(429, { error: "rate_limited" }, { "retry-after": "60" });
-        }
-
-        if (cached && cached.expiresAt > Date.now()) {
-          log(env, "info", "license.validation.cache_hit", {
-            requestId,
-            ip,
-            licenseHash: shortHash(licenseHash),
-            fingerprintHash: shortHash(fpHash),
-            status: cached.status,
-            ok: cached.ok,
-            ageMs: Date.now() - cached.cachedAt,
-            ttlRemainingMs: cached.expiresAt - Date.now(),
-            durationMs: Date.now() - start
-          });
-          return json(cached.status, { ...cached, source: "cache" }, { "x-proxy-cache": "hit" });
-        }
-
-        const existing = state.inflight.get(cacheKey);
-        if (existing) {
-          log(env, "info", "license.validation.inflight_join", {
-            requestId,
-            ip,
-            licenseHash: shortHash(licenseHash),
-            fingerprintHash: shortHash(fpHash)
-          });
-          return existing;
-        }
-
-        const requestPromise = (async () => {
-          try {
-            log(env, "info", "license.validation.upstream_start", {
-              requestId,
-              ip,
-              licenseHash: shortHash(licenseHash),
-              fingerprintHash: shortHash(fpHash)
-            });
-            const fresh = await callKeygen(env, parsed.licenseKey, parsed.fingerprint);
-            state.cache.set(cacheKey, fresh);
-            log(env, fresh.ok ? "info" : "warn", "license.validation.upstream_result", {
-              requestId,
-              ip,
-              licenseHash: shortHash(licenseHash),
-              fingerprintHash: shortHash(fpHash),
-              status: fresh.status,
-              ok: fresh.ok,
-              cacheTtlMs: fresh.expiresAt - fresh.cachedAt,
-              durationMs: Date.now() - start
-            });
-            return json(fresh.status, { ...fresh, source: "keygen" }, { "x-proxy-cache": "miss" });
-          } catch (error) {
-            if (cached?.ok && cached.graceUntil && cached.graceUntil > Date.now()) {
-              log(env, "error", "license.validation.upstream_error_grace", {
-                requestId,
-                ip,
-                licenseHash: shortHash(licenseHash),
-                fingerprintHash: shortHash(fpHash),
-                durationMs: Date.now() - start,
-                error: errorMessage(error)
-              });
-              return json(200, { ...cached, source: "cache-grace-error" }, { "x-proxy-cache": "grace" });
-            }
-
-            log(env, "error", "license.validation.upstream_error", {
-              requestId,
-              ip,
-              licenseHash: shortHash(licenseHash),
-              fingerprintHash: shortHash(fpHash),
-              durationMs: Date.now() - start,
-              error: errorMessage(error)
-            });
-
-            return json(503, {
-              error: "upstream_unavailable",
-              message: errorMessage(error)
-            });
-          } finally {
-            state.inflight.delete(cacheKey);
-          }
-        })();
-
-        state.inflight.set(cacheKey, requestPromise);
-        return requestPromise;
       }
     },
     fetch(req) {
@@ -763,13 +531,9 @@ if (import.meta.main) {
     port: server.port,
     keygenOrigin: env.keygenOrigin,
     keygenAccountConfigured: Boolean(env.keygenAccount),
-    keygenProductConfigured: Boolean(env.keygenProduct),
     forwardClientHost: env.forwardClientHost,
     trustProxy: env.trustProxy,
     logLevel: safeLogLevel(env.logLevel),
-    cacheValidTtlMs: env.validTtlMs,
-    cacheInvalidTtlMs: env.invalidTtlMs,
-    cacheGraceMs: env.graceMs,
     rateLimits: {
       ip: env.ipLimit,
       key: env.keyLimit,
