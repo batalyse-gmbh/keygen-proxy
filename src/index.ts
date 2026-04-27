@@ -1,4 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import http from "node:http";
+import https from "node:https";
 
 type CachedValidation = {
   ok: boolean;
@@ -15,38 +17,135 @@ type RateWindow = {
   resetAt: number;
 };
 
-const env = {
-  port: Number(Bun.env.PORT ?? 3000),
-  keygenAccount: Bun.env.KEYGEN_ACCOUNT,
-  keygenToken: Bun.env.KEYGEN_TOKEN,
-  keygenProduct: Bun.env.KEYGEN_PRODUCT,
-  validTtlMs: Number(Bun.env.CACHE_VALID_TTL_MS ?? 24 * 60 * 60 * 1000),
-  invalidTtlMs: Number(Bun.env.CACHE_INVALID_TTL_MS ?? 5 * 60 * 1000),
-  graceMs: Number(Bun.env.CACHE_GRACE_MS ?? 3 * 24 * 60 * 60 * 1000)
+type UpstreamResponse = {
+  status: number;
+  statusText: string;
+  headers: Headers;
+  body: Buffer;
 };
 
-if (!env.keygenAccount || !env.keygenToken) {
-  throw new Error("Missing KEYGEN_ACCOUNT or KEYGEN_TOKEN");
+type LogLevel = "debug" | "info" | "warn" | "error";
+
+type AppEnv = {
+  port: number;
+  keygenAccount: string;
+  keygenProduct?: string;
+  keygenOrigin: string;
+  forwardClientHost: boolean;
+  trustProxy: boolean;
+  logLevel: LogLevel;
+  validTtlMs: number;
+  invalidTtlMs: number;
+  graceMs: number;
+  ipLimit: { max: number; windowMs: number };
+  keyLimit: { max: number; windowMs: number };
+  fpLimit: { max: number; windowMs: number };
+};
+
+type AppState = {
+  cache: Map<string, CachedValidation>;
+  ipWindow: Map<string, RateWindow>;
+  keyWindow: Map<string, RateWindow>;
+  fpWindow: Map<string, RateWindow>;
+  inflight: Map<string, Promise<Response>>;
+};
+
+type ValidationPayload = {
+  licenseKey: string;
+  fingerprint: string;
+};
+
+type BunEnv = Record<string, string | undefined>;
+
+const logLevelRank: Record<LogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40
+};
+
+function parseEnv(source: BunEnv = Bun.env): AppEnv {
+  const env = {
+    port: Number(source.PORT ?? 3000),
+    keygenAccount: source.KEYGEN_ACCOUNT,
+    keygenProduct: source.KEYGEN_PRODUCT,
+    keygenOrigin: source.KEYGEN_ORIGIN ?? "https://api.keygen.sh",
+    forwardClientHost: source.KEYGEN_FORWARD_CLIENT_HOST === "true",
+    trustProxy: source.TRUST_PROXY === "true",
+    logLevel: (source.LOG_LEVEL ?? "info").toLowerCase() as LogLevel,
+    validTtlMs: Number(source.CACHE_VALID_TTL_MS ?? 24 * 60 * 60 * 1000),
+    invalidTtlMs: Number(source.CACHE_INVALID_TTL_MS ?? 5 * 60 * 1000),
+    graceMs: Number(source.CACHE_GRACE_MS ?? 3 * 24 * 60 * 60 * 1000),
+    ipLimit: { max: Number(source.RL_IP_MAX ?? 20), windowMs: 60_000 },
+    keyLimit: { max: Number(source.RL_KEY_MAX ?? 1), windowMs: Number(source.RL_KEY_WINDOW_MS ?? 10 * 60_000) },
+    fpLimit: { max: Number(source.RL_FP_MAX ?? 1), windowMs: Number(source.RL_FP_WINDOW_MS ?? 10 * 60_000) }
+  };
+
+  if (!env.keygenAccount) {
+    throw new Error("Missing KEYGEN_ACCOUNT");
+  }
+
+  return env as AppEnv;
 }
 
-const cache = new Map<string, CachedValidation>();
-const ipWindow = new Map<string, RateWindow>();
-const keyWindow = new Map<string, RateWindow>();
-const fpWindow = new Map<string, RateWindow>();
-const inflight = new Map<string, Promise<Response>>();
-
-const ipLimit = { max: Number(Bun.env.RL_IP_MAX ?? 20), windowMs: 60_000 };
-const keyLimit = { max: Number(Bun.env.RL_KEY_MAX ?? 1), windowMs: Number(Bun.env.RL_KEY_WINDOW_MS ?? 10 * 60_000) };
-const fpLimit = { max: Number(Bun.env.RL_FP_MAX ?? 1), windowMs: Number(Bun.env.RL_FP_WINDOW_MS ?? 10 * 60_000) };
+function createState(): AppState {
+  return {
+    cache: new Map<string, CachedValidation>(),
+    ipWindow: new Map<string, RateWindow>(),
+    keyWindow: new Map<string, RateWindow>(),
+    fpWindow: new Map<string, RateWindow>(),
+    inflight: new Map<string, Promise<Response>>()
+  };
+}
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function getIp(req: Request): string {
+function safeLogLevel(value: LogLevel): LogLevel {
+  return value in logLevelRank ? value : "info";
+}
+
+function shortHash(hash: string): string {
+  return hash.slice(0, 12);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
+function getRequestId(req: Request): string {
+  return req.headers.get("x-request-id") ?? randomUUID();
+}
+
+function log(env: AppEnv, level: LogLevel, event: string, fields: Record<string, unknown> = {}) {
+  if (logLevelRank[level] < logLevelRank[safeLogLevel(env.logLevel)]) {
+    return;
+  }
+
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...fields
+  };
+
+  const line = JSON.stringify(payload);
+  if (level === "error") {
+    console.error(line);
+  } else if (level === "warn") {
+    console.warn(line);
+  } else {
+    console.log(line);
+  }
+}
+
+function getIp(req: Request, env: AppEnv): string {
+  if (!env.trustProxy) return "direct";
+
   const forwarded = req.headers.get("x-forwarded-for");
   if (forwarded) return forwarded.split(",")[0]!.trim();
-  return "unknown";
+  return "direct";
 }
 
 function withinLimit(bucket: Map<string, RateWindow>, key: string, max: number, windowMs: number): boolean {
@@ -81,13 +180,62 @@ function json(status: number, payload: unknown, headers: HeadersInit = {}) {
   });
 }
 
-async function callKeygen(licenseKey: string, fingerprint: string): Promise<CachedValidation> {
-  const endpoint = `https://api.keygen.sh/v1/accounts/${env.keygenAccount}/licenses/actions/validate-key`;
+function parseValidationPayload(raw: string): ValidationPayload | null {
+  const parsed = readJsonSafe(raw) as { licenseKey?: string; fingerprint?: string; meta?: { key?: string; scope?: { fingerprint?: string } } } | null;
+  const licenseKey = parsed?.licenseKey ?? parsed?.meta?.key;
+  const fingerprint = parsed?.fingerprint ?? parsed?.meta?.scope?.fingerprint;
+
+  if (!licenseKey || !fingerprint) return null;
+  return { licenseKey, fingerprint };
+}
+
+function isValidationPayloadUsable(payload: ValidationPayload): boolean {
+  return payload.licenseKey.length >= 8 && payload.fingerprint.length >= 8;
+}
+
+function cacheKeyFor(env: AppEnv, payload: ValidationPayload): { cacheKey: string; licenseHash: string; fpHash: string } {
+  const licenseHash = sha256(payload.licenseKey);
+  const fpHash = sha256(payload.fingerprint);
+  const cacheKey = `license_validation:${licenseHash}:${fpHash}:${env.keygenProduct ?? "*"}`;
+  return { cacheKey, licenseHash, fpHash };
+}
+
+function isAllowedKeygenValidationProxyPath(pathname: string, env: AppEnv): boolean {
+  return pathname === `/v1/accounts/${env.keygenAccount}/licenses/actions/validate-key`;
+}
+
+function isAllowedKeygenEntitlementsProxyPath(pathname: string, env: AppEnv): boolean {
+  const prefix = `/v1/accounts/${env.keygenAccount}/licenses/`;
+  if (!pathname.startsWith(prefix)) return false;
+
+  const parts = pathname.slice(prefix.length).split("/");
+  return parts.length === 2 && parts[0].length > 0 && parts[1] === "entitlements";
+}
+
+function parseBasicLicenseAuthorization(header: string | null): string | null {
+  if (!header?.toLowerCase().startsWith("basic ")) return null;
+
+  try {
+    const credentials = Buffer.from(header.slice("basic ".length).trim(), "base64").toString("utf8");
+    const separator = credentials.indexOf(":");
+    if (separator === -1) return null;
+
+    const username = credentials.slice(0, separator);
+    const licenseKey = credentials.slice(separator + 1);
+    if (username !== "license" || licenseKey.length < 8) return null;
+    return licenseKey;
+  } catch {
+    return null;
+  }
+}
+
+async function callKeygen(env: AppEnv, licenseKey: string, fingerprint: string): Promise<CachedValidation> {
+  const endpoint = `${env.keygenOrigin}/v1/accounts/${env.keygenAccount}/licenses/actions/validate-key`;
+  const start = Date.now();
 
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${env.keygenToken}`,
       accept: "application/vnd.api+json",
       "content-type": "application/vnd.api+json"
     },
@@ -106,6 +254,12 @@ async function callKeygen(licenseKey: string, fingerprint: string): Promise<Cach
   const parsedBody = readJsonSafe(textBody) ?? { raw: textBody };
   const now = Date.now();
   const ok = response.ok;
+  log(env, ok ? "info" : "warn", "keygen.validation.response", {
+    status: response.status,
+    ok,
+    durationMs: Date.now() - start,
+    bodyBytes: Buffer.byteLength(textBody)
+  });
 
   return {
     ok,
@@ -122,85 +276,504 @@ async function callKeygen(licenseKey: string, fingerprint: string): Promise<Cach
   };
 }
 
-function getCached(key: string): CachedValidation | undefined {
-  const entry = cache.get(key);
+function getCached(state: AppState, key: string): CachedValidation | undefined {
+  const entry = state.cache.get(key);
   if (!entry) return undefined;
   if (entry.graceUntil && entry.graceUntil < Date.now()) {
-    cache.delete(key);
+    state.cache.delete(key);
     return undefined;
   }
   return entry;
 }
 
-const server = Bun.serve({
-  port: env.port,
-  routes: {
-    "/health": () => json(200, { ok: true }),
-    "/license/validate": async (req) => {
-      if (req.method !== "POST") return json(405, { error: "method_not_allowed" });
+function isKeygenApiPath(pathname: string): boolean {
+  return pathname.startsWith("/v1/");
+}
 
-      const ip = getIp(req);
-      const raw = await req.text();
-      const parsed = readJsonSafe(raw) as { licenseKey?: string; fingerprint?: string } | null;
+function buildKeygenValidationHeaders(req: Request, upstreamUrl: URL, env: AppEnv): Headers {
+  const headers = new Headers({
+    accept: "application/vnd.api+json",
+    "content-type": "application/vnd.api+json"
+  });
+  const forwardedHost = env.forwardClientHost ? req.headers.get("host") : upstreamUrl.host;
+  headers.set("host", forwardedHost ?? upstreamUrl.host);
 
-      if (!parsed?.licenseKey || !parsed?.fingerprint) {
-        return json(400, { error: "licenseKey and fingerprint are required" });
-      }
+  return headers;
+}
 
-      if (parsed.licenseKey.length < 8 || parsed.fingerprint.length < 8) {
-        return json(400, { error: "licenseKey/fingerprint too short" });
-      }
+function buildKeygenEntitlementsHeaders(req: Request, upstreamUrl: URL, env: AppEnv, authorization: string): Headers {
+  const headers = new Headers({
+    accept: "application/vnd.api+json",
+    authorization
+  });
+  const forwardedHost = env.forwardClientHost ? req.headers.get("host") : upstreamUrl.host;
+  headers.set("host", forwardedHost ?? upstreamUrl.host);
 
-      const licenseHash = sha256(parsed.licenseKey);
-      const fpHash = sha256(parsed.fingerprint);
-      const cacheKey = `license_validation:${licenseHash}:${fpHash}:${env.keygenProduct ?? "*"}`;
+  return headers;
+}
 
-      const isAllowed =
-        withinLimit(ipWindow, ip, ipLimit.max, ipLimit.windowMs) &&
-        withinLimit(keyWindow, licenseHash, keyLimit.max, keyLimit.windowMs) &&
-        withinLimit(fpWindow, fpHash, fpLimit.max, fpLimit.windowMs);
+function headersToObject(headers: Headers): Record<string, string> {
+  const result: Record<string, string> = {};
 
-      const cached = getCached(cacheKey);
-      if (!isAllowed) {
-        if (cached?.ok && cached.graceUntil && cached.graceUntil > Date.now()) {
-          return json(200, { ...cached, source: "cache-grace" }, { "x-proxy-cache": "grace" });
-        }
-        return json(429, { error: "rate_limited" }, { "retry-after": "60" });
-      }
+  for (const [name, value] of headers) {
+    result[name] = value;
+  }
 
-      if (cached && cached.expiresAt > Date.now()) {
-        return json(cached.status, { ...cached, source: "cache" }, { "x-proxy-cache": "hit" });
-      }
+  return result;
+}
 
-      const existing = inflight.get(cacheKey);
-      if (existing) return existing;
+function copyResponseHeaders(upstream: Pick<UpstreamResponse, "headers">): Headers {
+  const headers = new Headers();
+  const passthroughHeaders = [
+    "cache-control",
+    "content-type",
+    "date",
+    "digest",
+    "etag",
+    "keygen-signature",
+    "retry-after"
+  ];
 
-      const requestPromise = (async () => {
-        try {
-          const fresh = await callKeygen(parsed.licenseKey!, parsed.fingerprint!);
-          cache.set(cacheKey, fresh);
-          return json(fresh.status, { ...fresh, source: "keygen" }, { "x-proxy-cache": "miss" });
-        } catch (error) {
-          if (cached?.ok && cached.graceUntil && cached.graceUntil > Date.now()) {
-            return json(200, { ...cached, source: "cache-grace-error" }, { "x-proxy-cache": "grace" });
+  for (const name of passthroughHeaders) {
+    const value = upstream.headers.get(name);
+    if (value) {
+      headers.set(name, value);
+    }
+  }
+
+  return headers;
+}
+
+function proxyRequest(upstreamUrl: URL, method: string, headers: Headers, body?: Buffer): Promise<UpstreamResponse> {
+  const transport = upstreamUrl.protocol === "http:" ? http : https;
+
+  return new Promise((resolve, reject) => {
+    const upstreamReq = transport.request(
+      {
+        protocol: upstreamUrl.protocol,
+        hostname: upstreamUrl.hostname,
+        port: upstreamUrl.port,
+        path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+        method,
+        headers: headersToObject(headers),
+        servername: upstreamUrl.hostname
+      },
+      (upstreamRes) => {
+        const chunks: Buffer[] = [];
+
+        upstreamRes.on("data", (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+
+        upstreamRes.on("end", () => {
+          const responseHeaders = new Headers();
+          for (const [name, value] of Object.entries(upstreamRes.headers)) {
+            if (Array.isArray(value)) {
+              responseHeaders.set(name, value.join(", "));
+            } else if (value !== undefined) {
+              responseHeaders.set(name, value);
+            }
           }
 
-          return json(503, {
-            error: "upstream_unavailable",
-            message: error instanceof Error ? error.message : "Unknown error"
+          resolve({
+            status: upstreamRes.statusCode ?? 502,
+            statusText: upstreamRes.statusMessage ?? "Bad Gateway",
+            headers: responseHeaders,
+            body: Buffer.concat(chunks)
           });
-        } finally {
-          inflight.delete(cacheKey);
-        }
-      })();
+        });
+      }
+    );
 
-      inflight.set(cacheKey, requestPromise);
-      return requestPromise;
+    upstreamReq.on("error", reject);
+
+    if (body) {
+      upstreamReq.write(body);
     }
-  },
-  fetch() {
+    upstreamReq.end();
+  });
+}
+
+async function proxyKeygenApi(req: Request, env: AppEnv, state: AppState): Promise<Response> {
+  const requestId = getRequestId(req);
+  const url = new URL(req.url);
+  const start = Date.now();
+
+  const isValidationProxy = req.method === "POST" && isAllowedKeygenValidationProxyPath(url.pathname, env);
+  const isEntitlementsProxy = req.method === "GET" && isAllowedKeygenEntitlementsProxyPath(url.pathname, env);
+
+  if (!isValidationProxy && !isEntitlementsProxy) {
+    log(env, "warn", "proxy.rejected", {
+      requestId,
+      method: req.method,
+      pathname: url.pathname,
+      reason: "not_allowlisted"
+    });
     return json(404, { error: "not_found" });
   }
-});
 
-console.log(`Keygen proxy listening on http://localhost:${server.port}`);
+  if (isEntitlementsProxy) {
+    const authorization = req.headers.get("authorization");
+    const licenseKey = parseBasicLicenseAuthorization(authorization);
+
+    if (!authorization || !licenseKey) {
+      log(env, "warn", "proxy.bad_request", {
+        requestId,
+        reason: "missing_or_invalid_license_authorization",
+        durationMs: Date.now() - start
+      });
+      return json(401, { error: "license authorization is required" });
+    }
+
+    const ip = getIp(req, env);
+    const licenseHash = sha256(licenseKey);
+    const isAllowed =
+      withinLimit(state.ipWindow, `entitlements:${ip}`, env.ipLimit.max, env.ipLimit.windowMs) &&
+      withinLimit(state.keyWindow, `entitlements:${licenseHash}`, env.keyLimit.max, env.keyLimit.windowMs);
+
+    if (!isAllowed) {
+      log(env, "warn", "proxy.rate_limited", {
+        requestId,
+        ip,
+        licenseHash: shortHash(licenseHash),
+        durationMs: Date.now() - start
+      });
+      return json(429, { error: "rate_limited" }, { "retry-after": "60" });
+    }
+
+    const upstreamUrl = new URL(`${url.pathname}${url.search}`, env.keygenOrigin);
+    log(env, "info", "proxy.request", {
+      requestId,
+      method: req.method,
+      pathname: url.pathname,
+      upstreamHost: upstreamUrl.host,
+      bodyBytes: 0
+    });
+
+    let upstream: UpstreamResponse;
+    try {
+      upstream = await proxyRequest(upstreamUrl, req.method, buildKeygenEntitlementsHeaders(req, upstreamUrl, env, authorization));
+    } catch (error) {
+      log(env, "error", "proxy.upstream.error", {
+        requestId,
+        method: req.method,
+        pathname: url.pathname,
+        upstreamHost: upstreamUrl.host,
+        durationMs: Date.now() - start,
+        error: errorMessage(error)
+      });
+
+      return json(502, {
+        error: "upstream_unavailable",
+        message: errorMessage(error)
+      });
+    }
+
+    log(env, upstream.status >= 500 ? "warn" : "info", "proxy.response", {
+      requestId,
+      method: req.method,
+      pathname: url.pathname,
+      upstreamHost: upstreamUrl.host,
+      status: upstream.status,
+      durationMs: Date.now() - start,
+      bodyBytes: upstream.body.length,
+      signed: Boolean(upstream.headers.get("keygen-signature"))
+    });
+
+    return new Response(upstream.body, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: copyResponseHeaders(upstream)
+    });
+  }
+
+  const raw = await req.text();
+  const payload = parseValidationPayload(raw);
+
+  if (!payload) {
+    log(env, "warn", "proxy.bad_request", {
+      requestId,
+      reason: "missing_license_or_fingerprint",
+      durationMs: Date.now() - start
+    });
+    return json(400, { error: "license key and fingerprint are required" });
+  }
+
+  if (!isValidationPayloadUsable(payload)) {
+    log(env, "warn", "proxy.bad_request", {
+      requestId,
+      reason: "license_or_fingerprint_too_short",
+      licenseLength: payload.licenseKey.length,
+      fingerprintLength: payload.fingerprint.length,
+      durationMs: Date.now() - start
+    });
+    return json(400, { error: "license key/fingerprint too short" });
+  }
+
+  const ip = getIp(req, env);
+  const { licenseHash, fpHash } = cacheKeyFor(env, payload);
+  const isAllowed =
+    withinLimit(state.ipWindow, ip, env.ipLimit.max, env.ipLimit.windowMs) &&
+    withinLimit(state.keyWindow, licenseHash, env.keyLimit.max, env.keyLimit.windowMs) &&
+    withinLimit(state.fpWindow, fpHash, env.fpLimit.max, env.fpLimit.windowMs);
+
+  if (!isAllowed) {
+    log(env, "warn", "proxy.rate_limited", {
+      requestId,
+      ip,
+      licenseHash: shortHash(licenseHash),
+      fingerprintHash: shortHash(fpHash),
+      durationMs: Date.now() - start
+    });
+    return json(429, { error: "rate_limited" }, { "retry-after": "60" });
+  }
+
+  const upstreamUrl = new URL(`${url.pathname}${url.search}`, env.keygenOrigin);
+  const body = Buffer.from(raw);
+
+  log(env, "info", "proxy.request", {
+    requestId,
+    method: req.method,
+    pathname: url.pathname,
+    upstreamHost: upstreamUrl.host,
+    bodyBytes: body.length
+  });
+
+  let upstream: UpstreamResponse;
+  try {
+    upstream = await proxyRequest(upstreamUrl, req.method, buildKeygenValidationHeaders(req, upstreamUrl, env), body);
+  } catch (error) {
+    log(env, "error", "proxy.upstream.error", {
+      requestId,
+      method: req.method,
+      pathname: url.pathname,
+      upstreamHost: upstreamUrl.host,
+      durationMs: Date.now() - start,
+      error: errorMessage(error)
+    });
+
+    return json(502, {
+      error: "upstream_unavailable",
+      message: errorMessage(error)
+    });
+  }
+
+  log(env, upstream.status >= 500 ? "warn" : "info", "proxy.response", {
+    requestId,
+    method: req.method,
+    pathname: url.pathname,
+    upstreamHost: upstreamUrl.host,
+    status: upstream.status,
+    durationMs: Date.now() - start,
+    bodyBytes: upstream.body.length,
+    signed: Boolean(upstream.headers.get("keygen-signature"))
+  });
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: copyResponseHeaders(upstream)
+  });
+}
+
+export function createKeygenProxyServer(env: AppEnv = parseEnv(), state: AppState = createState()) {
+  return Bun.serve({
+    port: env.port,
+    routes: {
+      "/health": (req) => {
+        log(env, "debug", "health.request", {
+          requestId: getRequestId(req),
+          method: req.method
+        });
+        return json(200, { ok: true });
+      },
+      "/license/validate": async (req) => {
+        const requestId = getRequestId(req);
+        const start = Date.now();
+
+        if (req.method !== "POST") {
+          log(env, "warn", "license.validation.method_not_allowed", {
+            requestId,
+            method: req.method
+          });
+          return json(405, { error: "method_not_allowed" });
+        }
+
+        const ip = getIp(req, env);
+        const raw = await req.text();
+        const parsed = parseValidationPayload(raw);
+
+        log(env, "info", "license.validation.request", {
+          requestId,
+          ip,
+          bodyBytes: Buffer.byteLength(raw)
+        });
+
+        if (!parsed) {
+          log(env, "warn", "license.validation.bad_request", {
+            requestId,
+            reason: "missing_license_or_fingerprint",
+            durationMs: Date.now() - start
+          });
+          return json(400, { error: "licenseKey and fingerprint are required" });
+        }
+
+        if (!isValidationPayloadUsable(parsed)) {
+          log(env, "warn", "license.validation.bad_request", {
+            requestId,
+            reason: "license_or_fingerprint_too_short",
+            licenseLength: parsed.licenseKey.length,
+            fingerprintLength: parsed.fingerprint.length,
+            durationMs: Date.now() - start
+          });
+          return json(400, { error: "licenseKey/fingerprint too short" });
+        }
+
+        const { cacheKey, licenseHash, fpHash } = cacheKeyFor(env, parsed);
+
+        const isAllowed =
+          withinLimit(state.ipWindow, ip, env.ipLimit.max, env.ipLimit.windowMs) &&
+          withinLimit(state.keyWindow, licenseHash, env.keyLimit.max, env.keyLimit.windowMs) &&
+          withinLimit(state.fpWindow, fpHash, env.fpLimit.max, env.fpLimit.windowMs);
+
+        const cached = getCached(state, cacheKey);
+        if (!isAllowed) {
+          if (cached?.ok && cached.graceUntil && cached.graceUntil > Date.now()) {
+            log(env, "warn", "license.validation.rate_limited_grace", {
+              requestId,
+              ip,
+              licenseHash: shortHash(licenseHash),
+              fingerprintHash: shortHash(fpHash),
+              durationMs: Date.now() - start
+            });
+            return json(200, { ...cached, source: "cache-grace" }, { "x-proxy-cache": "grace" });
+          }
+          log(env, "warn", "license.validation.rate_limited", {
+            requestId,
+            ip,
+            licenseHash: shortHash(licenseHash),
+            fingerprintHash: shortHash(fpHash),
+            durationMs: Date.now() - start
+          });
+          return json(429, { error: "rate_limited" }, { "retry-after": "60" });
+        }
+
+        if (cached && cached.expiresAt > Date.now()) {
+          log(env, "info", "license.validation.cache_hit", {
+            requestId,
+            ip,
+            licenseHash: shortHash(licenseHash),
+            fingerprintHash: shortHash(fpHash),
+            status: cached.status,
+            ok: cached.ok,
+            ageMs: Date.now() - cached.cachedAt,
+            ttlRemainingMs: cached.expiresAt - Date.now(),
+            durationMs: Date.now() - start
+          });
+          return json(cached.status, { ...cached, source: "cache" }, { "x-proxy-cache": "hit" });
+        }
+
+        const existing = state.inflight.get(cacheKey);
+        if (existing) {
+          log(env, "info", "license.validation.inflight_join", {
+            requestId,
+            ip,
+            licenseHash: shortHash(licenseHash),
+            fingerprintHash: shortHash(fpHash)
+          });
+          return existing;
+        }
+
+        const requestPromise = (async () => {
+          try {
+            log(env, "info", "license.validation.upstream_start", {
+              requestId,
+              ip,
+              licenseHash: shortHash(licenseHash),
+              fingerprintHash: shortHash(fpHash)
+            });
+            const fresh = await callKeygen(env, parsed.licenseKey, parsed.fingerprint);
+            state.cache.set(cacheKey, fresh);
+            log(env, fresh.ok ? "info" : "warn", "license.validation.upstream_result", {
+              requestId,
+              ip,
+              licenseHash: shortHash(licenseHash),
+              fingerprintHash: shortHash(fpHash),
+              status: fresh.status,
+              ok: fresh.ok,
+              cacheTtlMs: fresh.expiresAt - fresh.cachedAt,
+              durationMs: Date.now() - start
+            });
+            return json(fresh.status, { ...fresh, source: "keygen" }, { "x-proxy-cache": "miss" });
+          } catch (error) {
+            if (cached?.ok && cached.graceUntil && cached.graceUntil > Date.now()) {
+              log(env, "error", "license.validation.upstream_error_grace", {
+                requestId,
+                ip,
+                licenseHash: shortHash(licenseHash),
+                fingerprintHash: shortHash(fpHash),
+                durationMs: Date.now() - start,
+                error: errorMessage(error)
+              });
+              return json(200, { ...cached, source: "cache-grace-error" }, { "x-proxy-cache": "grace" });
+            }
+
+            log(env, "error", "license.validation.upstream_error", {
+              requestId,
+              ip,
+              licenseHash: shortHash(licenseHash),
+              fingerprintHash: shortHash(fpHash),
+              durationMs: Date.now() - start,
+              error: errorMessage(error)
+            });
+
+            return json(503, {
+              error: "upstream_unavailable",
+              message: errorMessage(error)
+            });
+          } finally {
+            state.inflight.delete(cacheKey);
+          }
+        })();
+
+        state.inflight.set(cacheKey, requestPromise);
+        return requestPromise;
+      }
+    },
+    fetch(req) {
+      const url = new URL(req.url);
+      if (isKeygenApiPath(url.pathname)) {
+        return proxyKeygenApi(req, env, state);
+      }
+
+      log(env, "warn", "request.not_found", {
+        requestId: getRequestId(req),
+        method: req.method,
+        pathname: url.pathname
+      });
+      return json(404, { error: "not_found" });
+    }
+  });
+}
+
+if (import.meta.main) {
+  const env = parseEnv();
+  const server = createKeygenProxyServer(env);
+  log(env, "info", "server.started", {
+    port: server.port,
+    keygenOrigin: env.keygenOrigin,
+    keygenAccountConfigured: Boolean(env.keygenAccount),
+    keygenProductConfigured: Boolean(env.keygenProduct),
+    forwardClientHost: env.forwardClientHost,
+    trustProxy: env.trustProxy,
+    logLevel: safeLogLevel(env.logLevel),
+    cacheValidTtlMs: env.validTtlMs,
+    cacheInvalidTtlMs: env.invalidTtlMs,
+    cacheGraceMs: env.graceMs,
+    rateLimits: {
+      ip: env.ipLimit,
+      key: env.keyLimit,
+      fingerprint: env.fpLimit
+    }
+  });
+}
