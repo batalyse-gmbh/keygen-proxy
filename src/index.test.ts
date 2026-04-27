@@ -13,11 +13,13 @@ type CapturedRequest = {
 };
 
 const servers: Array<{ stop: () => void }> = [];
+const originalConsoleWarn = console.warn;
 
 afterEach(() => {
   while (servers.length > 0) {
     servers.pop()?.stop();
   }
+  console.warn = originalConsoleWarn;
 });
 
 function baseEnv(overrides: Partial<TestEnv> = {}): TestEnv {
@@ -108,6 +110,14 @@ function sha256(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function captureConsoleWarns() {
+  const lines: string[] = [];
+  console.warn = (line?: unknown, ...rest: unknown[]) => {
+    lines.push([line, ...rest].map(String).join(" "));
+  };
+  return lines;
+}
+
 function resetHeaders(token = "reset-token") {
   return {
     authorization: `Bearer ${token}`,
@@ -116,6 +126,55 @@ function resetHeaders(token = "reset-token") {
 }
 
 describe("Keygen-compatible proxy route", () => {
+  test("silently blocks unsupported non-API routes", async () => {
+    const proxy = await startProxy(baseEnv({ logLevel: "warn" }));
+    const warnLines = captureConsoleWarns();
+    const unsupportedPaths = [
+      "/",
+      "/config.json",
+      "/telescope/requests",
+      "/wp-login.php",
+      "/some-new-scanner-path-that-is-not-in-code",
+      "/unexpected-business-route",
+    ];
+
+    for (const path of unsupportedPaths) {
+      const response = await fetch(`http://127.0.0.1:${proxy.port}${path}`);
+      expect(response.status).toBe(404);
+    }
+
+    const optionsRoot = await fetch(`http://127.0.0.1:${proxy.port}/`, { method: "OPTIONS" });
+
+    expect(optionsRoot.status).toBe(404);
+    expect(warnLines).toHaveLength(0);
+  });
+
+  test("silently blocks unsupported Keygen API routes", async () => {
+    const proxy = await startProxy(baseEnv({ logLevel: "warn" }));
+    const warnLines = captureConsoleWarns();
+
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses`, {
+      method: "GET",
+    });
+
+    expect(response.status).toBe(404);
+    expect(warnLines).toHaveLength(0);
+  });
+
+  test("keeps warning logs for supported routes with bad input", async () => {
+    const proxy = await startProxy(baseEnv({ logLevel: "warn" }));
+    const warnLines = captureConsoleWarns();
+
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`, {
+      method: "POST",
+      body: "{}",
+    });
+
+    expect(response.status).toBe(400);
+    expect(warnLines).toHaveLength(1);
+    expect(warnLines[0].includes('"event":"proxy.bad_request"')).toBe(true);
+  });
+
   test("rejects non-allowlisted Keygen API paths without calling upstream", async () => {
     const mock = await startMockKeygen();
     const proxy = await startProxy(baseEnv({ keygenOrigin: `http://127.0.0.1:${mock.server.port}` }));
@@ -581,5 +640,159 @@ describe("rate-limit reset endpoint", () => {
       reset: { license: 1, fingerprint: 1 },
     });
     expect(afterReset.status).toBe(200);
+  });
+
+  test("resetting only IP also clears co-occurring license and fingerprint windows", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(
+      baseEnv({
+        keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
+        rateLimitResetToken: "reset-token",
+        trustProxy: true,
+        ipLimit: { max: 20, windowMs: 60_000 },
+        keyLimit: { max: 1, windowMs: 600_000 },
+        fpLimit: { max: 1, windowMs: 600_000 },
+      }),
+    );
+    const ip = "198.51.100.77";
+    const validationUrl = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+
+    const first = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ip },
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234"),
+    });
+    const limited = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ip },
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234"),
+    });
+
+    const reset = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ ip }),
+    });
+    const resetBody = await reset.json();
+
+    const afterReset = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ip },
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234"),
+    });
+
+    expect(first.status).toBe(200);
+    expect(limited.status).toBe(429);
+    expect(reset.status).toBe(200);
+    expect(resetBody).toMatchObject({ ok: true, reset: { license: 1, fingerprint: 1 } });
+    expect(afterReset.status).toBe(200);
+  });
+
+  test("resetting only license also clears co-occurring IP and fingerprint windows", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(
+      baseEnv({
+        keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
+        rateLimitResetToken: "reset-token",
+        ipLimit: { max: 1, windowMs: 60_000 },
+        keyLimit: { max: 20, windowMs: 600_000 },
+        fpLimit: { max: 1, windowMs: 600_000 },
+      }),
+    );
+    const licenseKey = "LICENSE-1234";
+    const fingerprint = "FINGERPRINT-1234";
+    const validationUrl = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+
+    const first = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody(licenseKey, fingerprint),
+    });
+    const limited = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody(licenseKey, fingerprint),
+    });
+
+    const reset = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ licenseKey }),
+    });
+    const resetBody = await reset.json();
+
+    const afterReset = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody(licenseKey, fingerprint),
+    });
+
+    expect(first.status).toBe(200);
+    expect(limited.status).toBe(429);
+    expect(reset.status).toBe(200);
+    expect(resetBody).toMatchObject({ ok: true, reset: { ip: 1, fingerprint: 1 } });
+    expect(afterReset.status).toBe(200);
+  });
+
+  test("expansion is one-hop: shared license does not pull in the other IP's window", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(
+      baseEnv({
+        keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
+        rateLimitResetToken: "reset-token",
+        trustProxy: true,
+        ipLimit: { max: 1, windowMs: 60_000 },
+        keyLimit: { max: 20, windowMs: 600_000 },
+        fpLimit: { max: 20, windowMs: 600_000 },
+      }),
+    );
+    const ipA = "198.51.100.10";
+    const ipB = "198.51.100.20";
+    const sharedLicense = "LICENSE-SHARED";
+    const sharedFingerprint = "FINGERPRINT-SHARED";
+    const validationUrl = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+
+    const aFirst = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ipA },
+      body: validationBody(sharedLicense, sharedFingerprint),
+    });
+    const bFirst = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ipB },
+      body: validationBody(sharedLicense, sharedFingerprint),
+    });
+    const aBlocked = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ipA },
+      body: validationBody(sharedLicense, sharedFingerprint),
+    });
+    const bBlocked = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ipB },
+      body: validationBody(sharedLicense, sharedFingerprint),
+    });
+
+    const reset = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ ip: ipA }),
+    });
+
+    const aAfterReset = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ipA },
+      body: validationBody(sharedLicense, sharedFingerprint),
+    });
+    const bAfterReset = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ipB },
+      body: validationBody(sharedLicense, sharedFingerprint),
+    });
+
+    expect(aFirst.status).toBe(200);
+    expect(bFirst.status).toBe(200);
+    expect(aBlocked.status).toBe(429);
+    expect(bBlocked.status).toBe(429);
+    expect(reset.status).toBe(200);
+    expect(aAfterReset.status).toBe(200);
+    expect(bAfterReset.status).toBe(429);
   });
 });

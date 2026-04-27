@@ -4,7 +4,7 @@ import type { AppEnv } from "./config";
 import { errorMessage, getIp, getRequestId, json, readJsonSafe } from "./http";
 import { log } from "./logging";
 import type { AppState } from "./rate-limits";
-import { sha256, shortHash, withinLimit } from "./rate-limits";
+import { maxWindowMs, recordAssociation, sha256, withinLimit } from "./rate-limits";
 
 type UpstreamResponse = {
   status: number;
@@ -262,15 +262,26 @@ async function proxyEntitlementsRequest(
 
   const ip = getIp(req, env);
   const licenseHash = sha256(licenseKey);
-  const isAllowed =
-    withinLimit(state.ipWindow, `entitlements:${ip}`, env.ipLimit.max, env.ipLimit.windowMs) &&
-    withinLimit(state.keyWindow, `entitlements:${licenseHash}`, env.keyLimit.max, env.keyLimit.windowMs);
+  let blockedBy: "ip" | "license" | null = null;
+  if (!withinLimit(state.ipWindow, `entitlements:${ip}`, env.ipLimit.max, env.ipLimit.windowMs)) {
+    blockedBy = "ip";
+  } else if (!withinLimit(state.keyWindow, `entitlements:${licenseHash}`, env.keyLimit.max, env.keyLimit.windowMs)) {
+    blockedBy = "license";
+  }
 
-  if (!isAllowed) {
+  recordAssociation(state, {
+    ip,
+    licenseHash,
+    fpHash: undefined,
+    expiresAt: Date.now() + maxWindowMs(env),
+  });
+
+  if (blockedBy) {
     log(env, "warn", "proxy.rate_limited", {
       requestId,
       ip,
-      licenseHash: shortHash(licenseHash),
+      licenseHash,
+      blockedBy,
       durationMs: Date.now() - start,
     });
     return json(429, { error: "rate_limited" }, { "retry-after": "60" });
@@ -320,17 +331,29 @@ async function proxyValidationRequest(
 
   const ip = getIp(req, env);
   const { licenseHash, fpHash } = validationHashesFor(payload);
-  const isAllowed =
-    withinLimit(state.ipWindow, ip, env.ipLimit.max, env.ipLimit.windowMs) &&
-    withinLimit(state.keyWindow, licenseHash, env.keyLimit.max, env.keyLimit.windowMs) &&
-    withinLimit(state.fpWindow, fpHash, env.fpLimit.max, env.fpLimit.windowMs);
+  let blockedBy: "ip" | "license" | "fingerprint" | null = null;
+  if (!withinLimit(state.ipWindow, ip, env.ipLimit.max, env.ipLimit.windowMs)) {
+    blockedBy = "ip";
+  } else if (!withinLimit(state.keyWindow, licenseHash, env.keyLimit.max, env.keyLimit.windowMs)) {
+    blockedBy = "license";
+  } else if (!withinLimit(state.fpWindow, fpHash, env.fpLimit.max, env.fpLimit.windowMs)) {
+    blockedBy = "fingerprint";
+  }
 
-  if (!isAllowed) {
+  recordAssociation(state, {
+    ip,
+    licenseHash,
+    fpHash,
+    expiresAt: Date.now() + maxWindowMs(env),
+  });
+
+  if (blockedBy) {
     log(env, "warn", "proxy.rate_limited", {
       requestId,
       ip,
-      licenseHash: shortHash(licenseHash),
-      fingerprintHash: shortHash(fpHash),
+      licenseHash,
+      fingerprintHash: fpHash,
+      blockedBy,
       durationMs: Date.now() - start,
     });
     return json(429, { error: "rate_limited" }, { "retry-after": "60" });
@@ -359,12 +382,6 @@ export async function proxyKeygenApi(req: Request, env: AppEnv, state: AppState)
   const isEntitlementsProxy = req.method === "GET" && isAllowedKeygenEntitlementsProxyPath(url.pathname, env);
 
   if (!isValidationProxy && !isEntitlementsProxy) {
-    log(env, "warn", "proxy.rejected", {
-      requestId,
-      method: req.method,
-      pathname: url.pathname,
-      reason: "not_allowlisted",
-    });
     return json(404, { error: "not_found" });
   }
 

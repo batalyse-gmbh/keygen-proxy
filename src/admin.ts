@@ -2,8 +2,15 @@ import { timingSafeEqual } from "node:crypto";
 import type { AppEnv } from "./config";
 import { getRequestId, json, readJsonSafe } from "./http";
 import { log } from "./logging";
-import type { AppState } from "./rate-limits";
-import { deleteKeys, hashFromRawOrHash, shortHash } from "./rate-limits";
+import type { AppState, ExpandedTargets } from "./rate-limits";
+import {
+  deleteKeys,
+  dropAssociationsMatching,
+  expandResetTargets,
+  hashFromRawOrHash,
+  pruneExpiredAssociations,
+  shortHash,
+} from "./rate-limits";
 
 export const adminRateLimitResetPath = "/admin/rate-limits/reset";
 
@@ -96,12 +103,31 @@ export async function resetRateLimits(req: Request, env: AppEnv, state: AppState
     return json(400, { error: "at least one reset target is required" });
   }
 
-  const ipResetKeys = payload.ip === undefined ? [] : [payload.ip, `entitlements:${payload.ip}`];
+  const now = Date.now();
+  pruneExpiredAssociations(state, now);
+
+  const expanded: ExpandedTargets = expandResetTargets(state.associations, {
+    ip: payload.ip,
+    licenseHash: licenseHash || undefined,
+    fpHash: fingerprintHash || undefined,
+  });
+
+  const ipKeys: string[] = [];
+  for (const ip of expanded.ips) {
+    ipKeys.push(ip, `entitlements:${ip}`);
+  }
+  const licenseKeys: string[] = [];
+  for (const hash of expanded.licenseHashes) {
+    licenseKeys.push(hash, `entitlements:${hash}`);
+  }
+
   const reset = {
-    ip: hasIpTarget ? deleteKeys(state.ipWindow, ipResetKeys) : 0,
-    license: hasLicenseTarget ? deleteKeys(state.keyWindow, [licenseHash, `entitlements:${licenseHash}`]) : 0,
-    fingerprint: hasFingerprintTarget ? deleteKeys(state.fpWindow, [fingerprintHash]) : 0,
+    ip: deleteKeys(state.ipWindow, ipKeys),
+    license: deleteKeys(state.keyWindow, licenseKeys),
+    fingerprint: deleteKeys(state.fpWindow, [...expanded.fpHashes]),
   };
+
+  dropAssociationsMatching(state, expanded);
 
   log(env, "info", "rate_limits.reset", {
     requestId,
@@ -110,8 +136,13 @@ export async function resetRateLimits(req: Request, env: AppEnv, state: AppState
     hasFingerprintTarget,
     licenseHash: licenseHash ? shortHash(licenseHash) : undefined,
     fingerprintHash: fingerprintHash ? shortHash(fingerprintHash) : undefined,
+    expanded: {
+      ips: expanded.ips.size,
+      licenses: expanded.licenseHashes.size,
+      fingerprints: expanded.fpHashes.size,
+    },
     reset,
-    durationMs: Date.now() - start,
+    durationMs: now - start,
   });
 
   return json(200, {

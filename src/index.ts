@@ -27,11 +27,6 @@ export function createKeygenProxyServer(env: AppEnv = parseEnv(), state: AppStat
         return proxyKeygenApi(req, env, state);
       }
 
-      log(env, "warn", "request.not_found", {
-        requestId: getRequestId(req),
-        method: req.method,
-        pathname: url.pathname,
-      });
       return json(404, { error: "not_found" });
     },
   });
