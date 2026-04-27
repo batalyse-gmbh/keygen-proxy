@@ -1,0 +1,41 @@
+services:
+  keygen-proxy:
+    build:
+      context: .
+    image: keygen-proxy:latest
+    container_name: keygen-proxy
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "3000"
+      KEYGEN_ORIGIN: "https://api.keygen.sh"
+      KEYGEN_FORWARD_CLIENT_HOST: "false"
+      TRUST_PROXY: "true"
+      LOG_LEVEL: "info"
+    expose:
+      - "3000"
+    networks:
+      - proxy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  proxy:
+    external: true
+    name: proxy

@@ -47,6 +47,31 @@ Other `/v1/*` routes are rejected locally.
 
 Simple health endpoint.
 
+### `POST /admin/rate-limits/reset`
+
+Operator endpoint for clearing in-memory rate-limit buckets for a specific IP,
+license, or fingerprint. It is disabled by default; set
+`RATE_LIMIT_RESET_TOKEN` to enable it. Requests must include
+`Authorization: Bearer $RATE_LIMIT_RESET_TOKEN`.
+
+Example:
+
+```bash
+curl -X POST http://localhost:3000/admin/rate-limits/reset \
+  -H "Authorization: Bearer $RATE_LIMIT_RESET_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ip": "198.51.100.10",
+    "licenseKey": "LICENSE-1234",
+    "fingerprint": "FINGERPRINT-1234"
+  }'
+```
+
+The endpoint also accepts `licenseHash` and `fingerprintHash` as SHA-256 hex
+values. IP resets clear both validation and entitlement IP buckets. License
+resets clear both validation and entitlement license buckets. Fingerprint resets
+clear the validation fingerprint bucket.
+
 ## Rate limits
 
 The default limits are tuned for about 30 clients checking every 6 hours, where
@@ -71,6 +96,9 @@ blocking each other.
 
 - This proxy does not require `KEYGEN_TOKEN`; keep privileged Keygen tokens out
   of this service.
+- `RATE_LIMIT_RESET_TOKEN` enables an authenticated operator reset endpoint for
+  clearing in-memory rate-limit buckets. Leave it unset unless you need that
+  operational escape hatch.
 - `TRUST_PROXY=false` ignores client-supplied `X-Forwarded-For` for rate limits.
   Set `TRUST_PROXY=true` only behind a trusted reverse proxy that strips and
   rewrites that header.

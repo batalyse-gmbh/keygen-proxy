@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import net from "node:net";
 import { createKeygenProxyServer } from "./index";
 
@@ -30,7 +31,7 @@ function baseEnv(overrides: Partial<TestEnv> = {}): TestEnv {
     ipLimit: { max: 20, windowMs: 60_000 },
     keyLimit: { max: 20, windowMs: 600_000 },
     fpLimit: { max: 20, windowMs: 600_000 },
-    ...overrides
+    ...overrides,
   };
 }
 
@@ -62,7 +63,7 @@ async function startMockKeygen() {
         method: req.method,
         pathname: url.pathname,
         authorization: req.headers.get("authorization"),
-        body: raw ? JSON.parse(raw) : null
+        body: raw ? JSON.parse(raw) : null,
       };
       requests.push(captured);
 
@@ -71,11 +72,11 @@ async function startMockKeygen() {
         {
           headers: {
             "keygen-signature": "sig",
-            digest: "digest"
-          }
-        }
+            digest: "digest",
+          },
+        },
       );
-    }
+    },
   });
   servers.push(server);
   return { server, requests };
@@ -93,14 +94,25 @@ function validationBody(key = "LICENSE-1234", fingerprint = "FINGERPRINT-1234") 
       key,
       scope: {
         fingerprint,
-        product: "prod_123"
-      }
-    }
+        product: "prod_123",
+      },
+    },
   });
 }
 
 function basicLicenseAuth(key = "LICENSE-1234") {
   return `Basic ${Buffer.from(`license:${key}`).toString("base64")}`;
+}
+
+function sha256(value: string) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function resetHeaders(token = "reset-token") {
+  return {
+    authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+  };
 }
 
 describe("Keygen-compatible proxy route", () => {
@@ -109,7 +121,7 @@ describe("Keygen-compatible proxy route", () => {
     const proxy = await startProxy(baseEnv({ keygenOrigin: `http://127.0.0.1:${mock.server.port}` }));
 
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses`, {
-      method: "GET"
+      method: "GET",
     });
 
     expect(response.status).toBe(404);
@@ -124,9 +136,9 @@ describe("Keygen-compatible proxy route", () => {
       method: "POST",
       headers: {
         authorization: "Bearer attacker-token",
-        "content-type": "application/vnd.api+json"
+        "content-type": "application/vnd.api+json",
       },
-      body: validationBody()
+      body: validationBody(),
     });
 
     expect(response.status).toBe(200);
@@ -135,7 +147,7 @@ describe("Keygen-compatible proxy route", () => {
     expect(mock.requests[0]).toMatchObject({
       method: "POST",
       pathname: "/v1/accounts/acct_123/licenses/actions/validate-key",
-      authorization: null
+      authorization: null,
     });
   });
 
@@ -145,7 +157,7 @@ describe("Keygen-compatible proxy route", () => {
 
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/other_acct/licenses/actions/validate-key`, {
       method: "POST",
-      body: validationBody()
+      body: validationBody(),
     });
 
     expect(response.status).toBe(404);
@@ -159,18 +171,18 @@ describe("Keygen-compatible proxy route", () => {
         keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
         ipLimit: { max: 1, windowMs: 60_000 },
         keyLimit: { max: 20, windowMs: 600_000 },
-        fpLimit: { max: 20, windowMs: 600_000 }
-      })
+        fpLimit: { max: 20, windowMs: 600_000 },
+      }),
     );
     const url = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
 
     const first = await fetch(url, {
       method: "POST",
-      body: validationBody("LICENSE-1234", "FINGERPRINT-1234")
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234"),
     });
     const second = await fetch(url, {
       method: "POST",
-      body: validationBody("LICENSE-5678", "FINGERPRINT-5678")
+      body: validationBody("LICENSE-5678", "FINGERPRINT-5678"),
     });
 
     expect(first.status).toBe(200);
@@ -186,8 +198,8 @@ describe("Keygen-compatible proxy route", () => {
       method: "GET",
       headers: {
         authorization: basicLicenseAuth(),
-        accept: "application/vnd.api+json"
-      }
+        accept: "application/vnd.api+json",
+      },
     });
 
     expect(response.status).toBe(200);
@@ -195,7 +207,7 @@ describe("Keygen-compatible proxy route", () => {
     expect(mock.requests[0]).toMatchObject({
       method: "GET",
       pathname: "/v1/accounts/acct_123/licenses/lic_123/entitlements",
-      authorization: basicLicenseAuth()
+      authorization: basicLicenseAuth(),
     });
   });
 
@@ -204,7 +216,7 @@ describe("Keygen-compatible proxy route", () => {
     const proxy = await startProxy(baseEnv({ keygenOrigin: `http://127.0.0.1:${mock.server.port}` }));
 
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/lic_123/entitlements`, {
-      method: "GET"
+      method: "GET",
     });
 
     expect(response.status).toBe(401);
@@ -218,7 +230,7 @@ describe("Keygen-compatible proxy route", () => {
     const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/lic_123/entitlements`, {
       method: "POST",
       headers: { authorization: basicLicenseAuth() },
-      body: "{}"
+      body: "{}",
     });
 
     expect(response.status).toBe(404);
@@ -232,17 +244,17 @@ describe("Keygen-compatible proxy route", () => {
         keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
         ipLimit: { max: 20, windowMs: 60_000 },
         keyLimit: { max: 1, windowMs: 600_000 },
-        fpLimit: { max: 20, windowMs: 600_000 }
-      })
+        fpLimit: { max: 20, windowMs: 600_000 },
+      }),
     );
 
     const validation = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`, {
       method: "POST",
-      body: validationBody("LICENSE-1234", "FINGERPRINT-1234")
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234"),
     });
     const entitlements = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/lic_123/entitlements`, {
       method: "GET",
-      headers: { authorization: basicLicenseAuth("LICENSE-1234") }
+      headers: { authorization: basicLicenseAuth("LICENSE-1234") },
     });
 
     expect(validation.status).toBe(200);
@@ -259,20 +271,20 @@ describe("client IP handling", () => {
         keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
         ipLimit: { max: 1, windowMs: 60_000 },
         keyLimit: { max: 20, windowMs: 600_000 },
-        fpLimit: { max: 20, windowMs: 600_000 }
-      })
+        fpLimit: { max: 20, windowMs: 600_000 },
+      }),
     );
     const url = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
 
     const first = await fetch(url, {
       method: "POST",
       headers: { "x-forwarded-for": "198.51.100.1" },
-      body: validationBody("LICENSE-1234", "FINGERPRINT-1234")
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234"),
     });
     const second = await fetch(url, {
       method: "POST",
       headers: { "x-forwarded-for": "198.51.100.2" },
-      body: validationBody("LICENSE-5678", "FINGERPRINT-5678")
+      body: validationBody("LICENSE-5678", "FINGERPRINT-5678"),
     });
 
     expect(first.status).toBe(200);
@@ -288,24 +300,286 @@ describe("client IP handling", () => {
         trustProxy: true,
         ipLimit: { max: 1, windowMs: 60_000 },
         keyLimit: { max: 20, windowMs: 600_000 },
-        fpLimit: { max: 20, windowMs: 600_000 }
-      })
+        fpLimit: { max: 20, windowMs: 600_000 },
+      }),
     );
     const url = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
 
     const first = await fetch(url, {
       method: "POST",
       headers: { "x-forwarded-for": "198.51.100.1" },
-      body: validationBody("LICENSE-1234", "FINGERPRINT-1234")
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234"),
     });
     const second = await fetch(url, {
       method: "POST",
       headers: { "x-forwarded-for": "198.51.100.2" },
-      body: validationBody("LICENSE-5678", "FINGERPRINT-5678")
+      body: validationBody("LICENSE-5678", "FINGERPRINT-5678"),
     });
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
     expect(mock.requests).toHaveLength(2);
+  });
+});
+
+describe("rate-limit reset endpoint", () => {
+  test("is unavailable when RATE_LIMIT_RESET_TOKEN is unset", async () => {
+    const proxy = await startProxy(baseEnv());
+
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ ip: "198.51.100.1" }),
+    });
+
+    expect(response.status).toBe(404);
+  });
+
+  test("rejects missing or invalid bearer tokens", async () => {
+    const proxy = await startProxy(baseEnv({ rateLimitResetToken: "reset-token" }));
+    const url = `http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`;
+
+    const missing = await fetch(url, {
+      method: "POST",
+      body: JSON.stringify({ ip: "198.51.100.1" }),
+    });
+    const invalid = await fetch(url, {
+      method: "POST",
+      headers: resetHeaders("wrong-token"),
+      body: JSON.stringify({ ip: "198.51.100.1" }),
+    });
+
+    expect(missing.status).toBe(401);
+    expect(invalid.status).toBe(401);
+  });
+
+  test("rejects empty bodies and bodies without reset targets", async () => {
+    const proxy = await startProxy(baseEnv({ rateLimitResetToken: "reset-token" }));
+    const url = `http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`;
+
+    const empty = await fetch(url, {
+      method: "POST",
+      headers: resetHeaders(),
+    });
+    const noTargets = await fetch(url, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({}),
+    });
+
+    expect(empty.status).toBe(400);
+    expect(noTargets.status).toBe(400);
+  });
+
+  test("resetting an IP unlocks validation and entitlement IP buckets", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(
+      baseEnv({
+        keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
+        rateLimitResetToken: "reset-token",
+        trustProxy: true,
+        ipLimit: { max: 1, windowMs: 60_000 },
+        keyLimit: { max: 20, windowMs: 600_000 },
+        fpLimit: { max: 20, windowMs: 600_000 },
+      }),
+    );
+    const ip = "198.51.100.50";
+    const validationUrl = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+    const entitlementsUrl = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/lic_123/entitlements`;
+
+    const validationFirst = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ip },
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234"),
+    });
+    const entitlementsFirst = await fetch(entitlementsUrl, {
+      method: "GET",
+      headers: { "x-forwarded-for": ip, authorization: basicLicenseAuth("LICENSE-1234") },
+    });
+    const validationLimited = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ip },
+      body: validationBody("LICENSE-5678", "FINGERPRINT-5678"),
+    });
+    const entitlementsLimited = await fetch(entitlementsUrl, {
+      method: "GET",
+      headers: { "x-forwarded-for": ip, authorization: basicLicenseAuth("LICENSE-5678") },
+    });
+
+    const reset = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ ip }),
+    });
+    const resetBody = await reset.json();
+
+    const validationAfterReset = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ip },
+      body: validationBody("LICENSE-5678", "FINGERPRINT-5678"),
+    });
+    const entitlementsAfterReset = await fetch(entitlementsUrl, {
+      method: "GET",
+      headers: { "x-forwarded-for": ip, authorization: basicLicenseAuth("LICENSE-5678") },
+    });
+
+    expect(validationFirst.status).toBe(200);
+    expect(entitlementsFirst.status).toBe(200);
+    expect(validationLimited.status).toBe(429);
+    expect(entitlementsLimited.status).toBe(429);
+    expect(reset.status).toBe(200);
+    expect(resetBody).toMatchObject({ ok: true, targets: { ip: true, license: false, fingerprint: false }, reset: { ip: 2 } });
+    expect(validationAfterReset.status).toBe(200);
+    expect(entitlementsAfterReset.status).toBe(200);
+  });
+
+  test("resetting a license unlocks validation and entitlement license buckets", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(
+      baseEnv({
+        keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
+        rateLimitResetToken: "reset-token",
+        ipLimit: { max: 20, windowMs: 60_000 },
+        keyLimit: { max: 1, windowMs: 600_000 },
+        fpLimit: { max: 20, windowMs: 600_000 },
+      }),
+    );
+    const licenseKey = "LICENSE-1234";
+    const validationUrl = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+    const entitlementsUrl = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/lic_123/entitlements`;
+
+    const validationFirst = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody(licenseKey, "FINGERPRINT-1234"),
+    });
+    const entitlementsFirst = await fetch(entitlementsUrl, {
+      method: "GET",
+      headers: { authorization: basicLicenseAuth(licenseKey) },
+    });
+    const validationLimited = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody(licenseKey, "FINGERPRINT-5678"),
+    });
+    const entitlementsLimited = await fetch(entitlementsUrl, {
+      method: "GET",
+      headers: { authorization: basicLicenseAuth(licenseKey) },
+    });
+
+    const reset = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ licenseKey }),
+    });
+    const resetBody = await reset.json();
+
+    const validationAfterReset = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody(licenseKey, "FINGERPRINT-5678"),
+    });
+    const entitlementsAfterReset = await fetch(entitlementsUrl, {
+      method: "GET",
+      headers: { authorization: basicLicenseAuth(licenseKey) },
+    });
+
+    expect(validationFirst.status).toBe(200);
+    expect(entitlementsFirst.status).toBe(200);
+    expect(validationLimited.status).toBe(429);
+    expect(entitlementsLimited.status).toBe(429);
+    expect(reset.status).toBe(200);
+    expect(resetBody).toMatchObject({ ok: true, targets: { ip: false, license: true, fingerprint: false }, reset: { license: 2 } });
+    expect(validationAfterReset.status).toBe(200);
+    expect(entitlementsAfterReset.status).toBe(200);
+  });
+
+  test("resetting a fingerprint unlocks validation fingerprint buckets", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(
+      baseEnv({
+        keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
+        rateLimitResetToken: "reset-token",
+        ipLimit: { max: 20, windowMs: 60_000 },
+        keyLimit: { max: 20, windowMs: 600_000 },
+        fpLimit: { max: 1, windowMs: 600_000 },
+      }),
+    );
+    const fingerprint = "FINGERPRINT-1234";
+    const validationUrl = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+
+    const first = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody("LICENSE-1234", fingerprint),
+    });
+    const limited = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody("LICENSE-5678", fingerprint),
+    });
+
+    const reset = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ fingerprint }),
+    });
+    const resetBody = await reset.json();
+
+    const afterReset = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody("LICENSE-5678", fingerprint),
+    });
+
+    expect(first.status).toBe(200);
+    expect(limited.status).toBe(429);
+    expect(reset.status).toBe(200);
+    expect(resetBody).toMatchObject({ ok: true, targets: { ip: false, license: false, fingerprint: true }, reset: { fingerprint: 1 } });
+    expect(afterReset.status).toBe(200);
+  });
+
+  test("accepts license and fingerprint hashes as reset targets", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(
+      baseEnv({
+        keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
+        rateLimitResetToken: "reset-token",
+        ipLimit: { max: 20, windowMs: 60_000 },
+        keyLimit: { max: 1, windowMs: 600_000 },
+        fpLimit: { max: 1, windowMs: 600_000 },
+      }),
+    );
+    const licenseKey = "LICENSE-1234";
+    const fingerprint = "FINGERPRINT-1234";
+    const validationUrl = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+
+    const first = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody(licenseKey, fingerprint),
+    });
+    const limited = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody(licenseKey, fingerprint),
+    });
+
+    const reset = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({
+        licenseHash: sha256(licenseKey),
+        fingerprintHash: sha256(fingerprint),
+      }),
+    });
+    const resetBody = await reset.json();
+
+    const afterReset = await fetch(validationUrl, {
+      method: "POST",
+      body: validationBody(licenseKey, fingerprint),
+    });
+
+    expect(first.status).toBe(200);
+    expect(limited.status).toBe(429);
+    expect(reset.status).toBe(200);
+    expect(resetBody).toMatchObject({
+      ok: true,
+      targets: { ip: false, license: true, fingerprint: true },
+      reset: { license: 1, fingerprint: 1 },
+    });
+    expect(afterReset.status).toBe(200);
   });
 });
