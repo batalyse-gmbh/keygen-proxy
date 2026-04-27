@@ -56,9 +56,9 @@ function parseEnv(source: BunEnv = Bun.env): AppEnv {
     forwardClientHost: source.KEYGEN_FORWARD_CLIENT_HOST === "true",
     trustProxy: source.TRUST_PROXY === "true",
     logLevel: (source.LOG_LEVEL ?? "info").toLowerCase() as LogLevel,
-    ipLimit: { max: Number(source.RL_IP_MAX ?? 20), windowMs: 60_000 },
-    keyLimit: { max: Number(source.RL_KEY_MAX ?? 1), windowMs: Number(source.RL_KEY_WINDOW_MS ?? 10 * 60_000) },
-    fpLimit: { max: Number(source.RL_FP_MAX ?? 1), windowMs: Number(source.RL_FP_WINDOW_MS ?? 10 * 60_000) }
+    ipLimit: { max: Number(source.RL_IP_MAX ?? 10), windowMs: 60_000 },
+    keyLimit: { max: Number(source.RL_KEY_MAX ?? 2), windowMs: Number(source.RL_KEY_WINDOW_MS ?? 6 * 60 * 60_000) },
+    fpLimit: { max: Number(source.RL_FP_MAX ?? 2), windowMs: Number(source.RL_FP_WINDOW_MS ?? 6 * 60 * 60_000) }
   };
 
   if (!env.keygenAccount) {

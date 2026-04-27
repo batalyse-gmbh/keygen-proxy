@@ -47,6 +47,26 @@ Other `/v1/*` routes are rejected locally.
 
 Simple health endpoint.
 
+## Rate limits
+
+The default limits are tuned for about 30 clients checking every 6 hours, where
+each check performs one validation request and one entitlement request:
+
+```env
+RL_IP_MAX=10
+RL_KEY_MAX=2
+RL_KEY_WINDOW_MS=21600000
+RL_FP_MAX=2
+RL_FP_WINDOW_MS=21600000
+```
+
+`RL_IP_MAX` allows 10 proxied Keygen requests per minute per client IP.
+`RL_KEY_MAX` and `RL_FP_MAX` allow two validation attempts per license key and
+fingerprint in each 6-hour window, giving each client one normal check plus one
+startup or retry allowance. Entitlement reads use a separate license-key bucket,
+so a normal validate + entitlements check can complete without the two calls
+blocking each other.
+
 ## Important notes
 
 - This proxy does not require `KEYGEN_TOKEN`; keep privileged Keygen tokens out
