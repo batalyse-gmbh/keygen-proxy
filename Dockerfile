@@ -7,5 +7,6 @@ RUN bun install --frozen-lockfile --production || bun install --production
 COPY src ./src
 
 ENV NODE_ENV=production
+USER bun
 EXPOSE 3000
 CMD ["bun", "run", "start"]

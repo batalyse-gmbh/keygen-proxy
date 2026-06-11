@@ -13,8 +13,9 @@
     "typecheck": "tsc"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.4.13",
-    "@types/node": "^25.6.0",
+    "@biomejs/biome": "^2.4.16",
+    "@types/bun": "^1.3.14",
+    "@types/node": "^25.9.3",
     "typescript": "^6.0.3"
   }
 }

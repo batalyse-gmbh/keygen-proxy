@@ -731,6 +731,36 @@ describe("rate-limit reset endpoint", () => {
     expect(afterReset.status).toBe(200);
   });
 
+  test("rejects non-hex license and fingerprint hashes", async () => {
+    const proxy = await startProxy(baseEnv({ rateLimitResetToken: "reset-token" }));
+    const url = `http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`;
+
+    const invalidLicenseHash = await fetch(url, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ licenseHash: "not-hex" }),
+    });
+    const invalidFingerprintHash = await fetch(url, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ fingerprintHash: "abc123" }),
+    });
+
+    expect(invalidLicenseHash.status).toBe(400);
+    expect(invalidFingerprintHash.status).toBe(400);
+  });
+
+  test("rejects non-POST requests with 404", async () => {
+    const proxy = await startProxy(baseEnv({ rateLimitResetToken: "reset-token" }));
+
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "GET",
+      headers: resetHeaders(),
+    });
+
+    expect(response.status).toBe(404);
+  });
+
   test("expansion is one-hop: shared license does not pull in the other IP's window", async () => {
     const mock = await startMockKeygen();
     const proxy = await startProxy(
@@ -794,5 +824,142 @@ describe("rate-limit reset endpoint", () => {
     expect(reset.status).toBe(200);
     expect(aAfterReset.status).toBe(200);
     expect(bAfterReset.status).toBe(429);
+
+    // The first reset must keep the association for IP B's still-throttled
+    // window so a later reset seeded on the shared license can reach it.
+    const licenseReset = await fetch(`http://127.0.0.1:${proxy.port}/admin/rate-limits/reset`, {
+      method: "POST",
+      headers: resetHeaders(),
+      body: JSON.stringify({ licenseKey: sharedLicense }),
+    });
+    const bAfterLicenseReset = await fetch(validationUrl, {
+      method: "POST",
+      headers: { "x-forwarded-for": ipB },
+      body: validationBody(sharedLicense, sharedFingerprint),
+    });
+
+    expect(licenseReset.status).toBe(200);
+    expect(bAfterLicenseReset.status).toBe(200);
+  });
+});
+
+describe("error and edge paths", () => {
+  test("returns a static 502 when the upstream is unavailable", async () => {
+    const proxy = await startProxy(baseEnv());
+
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`, {
+      method: "POST",
+      body: validationBody(),
+    });
+    const body = await response.json();
+
+    expect(response.status).toBe(502);
+    expect(body).toMatchObject({ error: "upstream_unavailable" });
+    expect("message" in body).toBe(false);
+  });
+
+  test("rejects Basic auth with a wrong username or too-short license key", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(baseEnv({ keygenOrigin: `http://127.0.0.1:${mock.server.port}` }));
+    const url = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/lic_123/entitlements`;
+
+    const wrongUsername = await fetch(url, {
+      method: "GET",
+      headers: { authorization: `Basic ${Buffer.from("user:LICENSE-1234").toString("base64")}` },
+    });
+    const shortKey = await fetch(url, {
+      method: "GET",
+      headers: { authorization: `Basic ${Buffer.from("license:short").toString("base64")}` },
+    });
+
+    expect(wrongUsername.status).toBe(401);
+    expect(shortKey.status).toBe(401);
+    expect(mock.requests).toHaveLength(0);
+  });
+
+  test("rejects too-short license keys and fingerprints", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(baseEnv({ keygenOrigin: `http://127.0.0.1:${mock.server.port}` }));
+    const url = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+
+    const shortKey = await fetch(url, {
+      method: "POST",
+      body: validationBody("short", "FINGERPRINT-1234"),
+    });
+    const shortFingerprint = await fetch(url, {
+      method: "POST",
+      body: validationBody("LICENSE-1234", "short"),
+    });
+
+    expect(shortKey.status).toBe(400);
+    expect(shortFingerprint.status).toBe(400);
+    expect(mock.requests).toHaveLength(0);
+  });
+
+  test("rate limits by the Keygen-native meta fields, not top-level aliases", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(
+      baseEnv({
+        keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
+        ipLimit: { max: 20, windowMs: 60_000 },
+        keyLimit: { max: 1, windowMs: 600_000 },
+        fpLimit: { max: 20, windowMs: 600_000 },
+      }),
+    );
+    const url = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+    const bodyWithDecoys = (decoy: string) =>
+      JSON.stringify({
+        licenseKey: decoy,
+        fingerprint: decoy,
+        meta: { key: "LICENSE-REAL", scope: { fingerprint: "FINGERPRINT-1234" } },
+      });
+
+    const first = await fetch(url, { method: "POST", body: bodyWithDecoys("DECOY-AAAAAAAA") });
+    const second = await fetch(url, { method: "POST", body: bodyWithDecoys("DECOY-BBBBBBBB") });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(429);
+    expect(mock.requests).toHaveLength(1);
+  });
+
+  test("429 responses report a retry-after derived from the blocking window", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(
+      baseEnv({
+        keygenOrigin: `http://127.0.0.1:${mock.server.port}`,
+        ipLimit: { max: 20, windowMs: 60_000 },
+        keyLimit: { max: 1, windowMs: 600_000 },
+        fpLimit: { max: 20, windowMs: 600_000 },
+      }),
+    );
+    const url = `http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`;
+
+    const first = await fetch(url, {
+      method: "POST",
+      body: validationBody("LICENSE-1234", "FINGERPRINT-1234"),
+    });
+    const limited = await fetch(url, {
+      method: "POST",
+      body: validationBody("LICENSE-1234", "FINGERPRINT-5678"),
+    });
+
+    expect(first.status).toBe(200);
+    expect(limited.status).toBe(429);
+    const retryAfter = Number(limited.headers.get("retry-after"));
+    expect(retryAfter).toBeGreaterThan(590);
+    expect(retryAfter).toBeLessThanOrEqual(600);
+  });
+
+  test("rejects oversized validation payloads before reading the body", async () => {
+    const mock = await startMockKeygen();
+    const proxy = await startProxy(baseEnv({ keygenOrigin: `http://127.0.0.1:${mock.server.port}` }));
+
+    const response = await fetch(`http://127.0.0.1:${proxy.port}/v1/accounts/acct_123/licenses/actions/validate-key`, {
+      method: "POST",
+      body: JSON.stringify({ meta: { key: "LICENSE-1234", scope: { fingerprint: "FINGERPRINT-1234" } }, padding: "x".repeat(17 * 1024) }),
+    });
+
+    expect(response.status).toBe(413);
+    expect(mock.requests).toHaveLength(0);
   });
 });

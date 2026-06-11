@@ -1,13 +1,14 @@
 import { adminRateLimitResetPath, resetRateLimits } from "./admin";
 import { type AppEnv, parseEnv } from "./config";
-import { getRequestId, json } from "./http";
+import { errorMessage, getRequestId, json } from "./http";
 import { isKeygenApiPath, proxyKeygenApi } from "./keygen";
-import { log, safeLogLevel } from "./logging";
+import { log } from "./logging";
 import { type AppState, createState } from "./rate-limits";
 
 export function createKeygenProxyServer(env: AppEnv = parseEnv(), state: AppState = createState()) {
   return Bun.serve({
     port: env.port,
+    maxRequestBodySize: 64 * 1024,
     routes: {
       "/health": (req) => {
         log(env, "debug", "health.request", {
@@ -17,17 +18,21 @@ export function createKeygenProxyServer(env: AppEnv = parseEnv(), state: AppStat
         return json(200, { ok: true });
       },
     },
-    fetch(req) {
+    fetch(req, server) {
       const url = new URL(req.url);
       if (url.pathname === adminRateLimitResetPath) {
         return resetRateLimits(req, env, state);
       }
 
       if (isKeygenApiPath(url.pathname)) {
-        return proxyKeygenApi(req, env, state);
+        return proxyKeygenApi(req, env, state, server);
       }
 
       return json(404, { error: "not_found" });
+    },
+    error(error) {
+      log(env, "error", "server.error", { error: errorMessage(error) });
+      return json(500, { error: "internal_error" });
     },
   });
 }
@@ -41,7 +46,7 @@ if (import.meta.main) {
     keygenAccountConfigured: Boolean(env.keygenAccount),
     forwardClientHost: env.forwardClientHost,
     trustProxy: env.trustProxy,
-    logLevel: safeLogLevel(env.logLevel),
+    logLevel: env.logLevel,
     rateLimitResetEnabled: Boolean(env.rateLimitResetToken),
     rateLimits: {
       ip: env.ipLimit,

@@ -1,10 +1,15 @@
 import http from "node:http";
 import https from "node:https";
+import type { Server } from "bun";
 import type { AppEnv } from "./config";
 import { errorMessage, getIp, getRequestId, json, readJsonSafe } from "./http";
 import { log } from "./logging";
-import type { AppState } from "./rate-limits";
-import { maxWindowMs, recordAssociation, sha256, withinLimit } from "./rate-limits";
+import type { AppState, RateWindow } from "./rate-limits";
+import { maxWindowMs, recordAssociation, sha256, shortHash, withinLimit } from "./rate-limits";
+
+const upstreamTimeoutMs = 15_000;
+const maxUpstreamResponseBytes = 5 * 1024 * 1024;
+const maxValidationBodyBytes = 16 * 1024;
 
 type UpstreamResponse = {
   status: number;
@@ -26,7 +31,6 @@ type KeygenProxyRequest = {
   url: URL;
   buildHeaders: (upstreamUrl: URL) => Headers;
   body?: Buffer;
-  bodyBytes: number;
 };
 
 export function isKeygenApiPath(pathname: string): boolean {
@@ -85,16 +89,6 @@ function buildKeygenHeaders(
   return headers;
 }
 
-function headersToObject(headers: Headers): Record<string, string> {
-  const result: Record<string, string> = {};
-
-  for (const [name, value] of headers) {
-    result[name] = value;
-  }
-
-  return result;
-}
-
 function copyResponseHeaders(upstream: Pick<UpstreamResponse, "headers">): Headers {
   const headers = new Headers();
   const passthroughHeaders = ["cache-control", "content-type", "date", "digest", "etag", "keygen-signature", "retry-after"];
@@ -115,8 +109,11 @@ function parseValidationPayload(raw: string): ValidationPayload | null {
     fingerprint?: string;
     meta?: { key?: string; scope?: { fingerprint?: string } };
   } | null;
-  const licenseKey = parsed?.licenseKey ?? parsed?.meta?.key;
-  const fingerprint = parsed?.fingerprint ?? parsed?.meta?.scope?.fingerprint;
+  // Prefer the Keygen-native fields: the raw body is forwarded upstream and
+  // Keygen only reads meta.key / meta.scope.fingerprint, so rate-limit
+  // identity must match what Keygen will actually validate.
+  const licenseKey = parsed?.meta?.key ?? parsed?.licenseKey;
+  const fingerprint = parsed?.meta?.scope?.fingerprint ?? parsed?.fingerprint;
 
   if (!licenseKey || !fingerprint) return null;
   return { licenseKey, fingerprint };
@@ -137,14 +134,24 @@ function proxyRequest(upstreamUrl: URL, method: string, headers: Headers, body?:
         port: upstreamUrl.port,
         path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
         method,
-        headers: headersToObject(headers),
+        headers: Object.fromEntries(headers),
         servername: upstreamUrl.hostname,
+        timeout: upstreamTimeoutMs,
       },
       (upstreamRes) => {
         const chunks: Buffer[] = [];
+        let receivedBytes = 0;
+
+        upstreamRes.on("error", reject);
 
         upstreamRes.on("data", (chunk) => {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          receivedBytes += buffer.length;
+          if (receivedBytes > maxUpstreamResponseBytes) {
+            upstreamRes.destroy(new Error("upstream_response_too_large"));
+            return;
+          }
+          chunks.push(buffer);
         });
 
         upstreamRes.on("end", () => {
@@ -168,6 +175,9 @@ function proxyRequest(upstreamUrl: URL, method: string, headers: Headers, body?:
     );
 
     upstreamReq.on("error", reject);
+    upstreamReq.on("timeout", () => {
+      upstreamReq.destroy(new Error("upstream_timeout"));
+    });
 
     if (body) {
       upstreamReq.write(body);
@@ -176,24 +186,10 @@ function proxyRequest(upstreamUrl: URL, method: string, headers: Headers, body?:
   });
 }
 
-function validationHashesFor(payload: ValidationPayload): { licenseHash: string; fpHash: string } {
-  const licenseHash = sha256(payload.licenseKey);
-  const fpHash = sha256(payload.fingerprint);
-  return { licenseHash, fpHash };
-}
-
-async function forwardKeygenRequest({
-  req,
-  env,
-  requestId,
-  start,
-  url,
-  buildHeaders,
-  body,
-  bodyBytes,
-}: KeygenProxyRequest): Promise<Response> {
+async function forwardKeygenRequest({ req, env, requestId, start, url, buildHeaders, body }: KeygenProxyRequest): Promise<Response> {
   const upstreamUrl = new URL(`${url.pathname}${url.search}`, env.keygenOrigin);
   const headers = buildHeaders(upstreamUrl);
+  const bodyBytes = body?.length ?? 0;
 
   log(env, "info", "proxy.request", {
     requestId,
@@ -216,10 +212,7 @@ async function forwardKeygenRequest({
       error: errorMessage(error),
     });
 
-    return json(502, {
-      error: "upstream_unavailable",
-      message: errorMessage(error),
-    });
+    return json(502, { error: "upstream_unavailable" });
   }
 
   log(env, upstream.status >= 500 ? "warn" : "info", "proxy.response", {
@@ -240,10 +233,59 @@ async function forwardKeygenRequest({
   });
 }
 
+type RateLimitCheck = {
+  bucket: Map<string, RateWindow>;
+  key: string;
+  limit: { max: number; windowMs: number };
+  blockedBy: "ip" | "license" | "fingerprint";
+};
+
+type RateLimitIdentity = {
+  ip: string;
+  licenseHash: string;
+  fpHash?: string;
+};
+
+function applyRateLimit(
+  env: AppEnv,
+  state: AppState,
+  requestId: string,
+  start: number,
+  identity: RateLimitIdentity,
+  checks: RateLimitCheck[],
+): Response | null {
+  for (const check of checks) {
+    if (withinLimit(check.bucket, check.key, check.limit.max, check.limit.windowMs)) continue;
+
+    const resetAt = check.bucket.get(check.key)?.resetAt ?? Date.now();
+    const retryAfterSeconds = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
+    log(env, "warn", "proxy.rate_limited", {
+      requestId,
+      ip: identity.ip,
+      licenseHash: shortHash(identity.licenseHash),
+      fingerprintHash: identity.fpHash ? shortHash(identity.fpHash) : undefined,
+      blockedBy: check.blockedBy,
+      durationMs: Date.now() - start,
+    });
+    return json(429, { error: "rate_limited" }, { "retry-after": String(retryAfterSeconds) });
+  }
+
+  // Record associations only for requests within the limits so blocked
+  // requests cannot grow the table with attacker-controlled values.
+  recordAssociation(state, {
+    ip: identity.ip,
+    licenseHash: identity.licenseHash,
+    fpHash: identity.fpHash,
+    expiresAt: Date.now() + maxWindowMs(env),
+  });
+  return null;
+}
+
 async function proxyEntitlementsRequest(
   req: Request,
   env: AppEnv,
   state: AppState,
+  server: Server<unknown>,
   url: URL,
   requestId: string,
   start: number,
@@ -260,32 +302,13 @@ async function proxyEntitlementsRequest(
     return json(401, { error: "license authorization is required" });
   }
 
-  const ip = getIp(req, env);
+  const ip = getIp(req, env, server);
   const licenseHash = sha256(licenseKey);
-  let blockedBy: "ip" | "license" | null = null;
-  if (!withinLimit(state.ipWindow, `entitlements:${ip}`, env.ipLimit.max, env.ipLimit.windowMs)) {
-    blockedBy = "ip";
-  } else if (!withinLimit(state.keyWindow, `entitlements:${licenseHash}`, env.keyLimit.max, env.keyLimit.windowMs)) {
-    blockedBy = "license";
-  }
-
-  recordAssociation(state, {
-    ip,
-    licenseHash,
-    fpHash: undefined,
-    expiresAt: Date.now() + maxWindowMs(env),
-  });
-
-  if (blockedBy) {
-    log(env, "warn", "proxy.rate_limited", {
-      requestId,
-      ip,
-      licenseHash,
-      blockedBy,
-      durationMs: Date.now() - start,
-    });
-    return json(429, { error: "rate_limited" }, { "retry-after": "60" });
-  }
+  const blocked = applyRateLimit(env, state, requestId, start, { ip, licenseHash }, [
+    { bucket: state.ipWindow, key: `entitlements:${ip}`, limit: env.ipLimit, blockedBy: "ip" },
+    { bucket: state.keyWindow, key: `entitlements:${licenseHash}`, limit: env.keyLimit, blockedBy: "license" },
+  ]);
+  if (blocked) return blocked;
 
   return forwardKeygenRequest({
     req,
@@ -294,7 +317,6 @@ async function proxyEntitlementsRequest(
     start,
     url,
     buildHeaders: (upstreamUrl) => buildKeygenHeaders(req, upstreamUrl, env, { authorization }),
-    bodyBytes: 0,
   });
 }
 
@@ -302,10 +324,22 @@ async function proxyValidationRequest(
   req: Request,
   env: AppEnv,
   state: AppState,
+  server: Server<unknown>,
   url: URL,
   requestId: string,
   start: number,
 ): Promise<Response> {
+  const contentLength = Number(req.headers.get("content-length") ?? 0);
+  if (contentLength > maxValidationBodyBytes) {
+    log(env, "warn", "proxy.bad_request", {
+      requestId,
+      reason: "payload_too_large",
+      contentLength,
+      durationMs: Date.now() - start,
+    });
+    return json(413, { error: "payload_too_large" });
+  }
+
   const raw = await req.text();
   const payload = parseValidationPayload(raw);
 
@@ -329,37 +363,15 @@ async function proxyValidationRequest(
     return json(400, { error: "license key/fingerprint too short" });
   }
 
-  const ip = getIp(req, env);
-  const { licenseHash, fpHash } = validationHashesFor(payload);
-  let blockedBy: "ip" | "license" | "fingerprint" | null = null;
-  if (!withinLimit(state.ipWindow, ip, env.ipLimit.max, env.ipLimit.windowMs)) {
-    blockedBy = "ip";
-  } else if (!withinLimit(state.keyWindow, licenseHash, env.keyLimit.max, env.keyLimit.windowMs)) {
-    blockedBy = "license";
-  } else if (!withinLimit(state.fpWindow, fpHash, env.fpLimit.max, env.fpLimit.windowMs)) {
-    blockedBy = "fingerprint";
-  }
-
-  recordAssociation(state, {
-    ip,
-    licenseHash,
-    fpHash,
-    expiresAt: Date.now() + maxWindowMs(env),
-  });
-
-  if (blockedBy) {
-    log(env, "warn", "proxy.rate_limited", {
-      requestId,
-      ip,
-      licenseHash,
-      fingerprintHash: fpHash,
-      blockedBy,
-      durationMs: Date.now() - start,
-    });
-    return json(429, { error: "rate_limited" }, { "retry-after": "60" });
-  }
-
-  const body = Buffer.from(raw);
+  const ip = getIp(req, env, server);
+  const licenseHash = sha256(payload.licenseKey);
+  const fpHash = sha256(payload.fingerprint);
+  const blocked = applyRateLimit(env, state, requestId, start, { ip, licenseHash, fpHash }, [
+    { bucket: state.ipWindow, key: ip, limit: env.ipLimit, blockedBy: "ip" },
+    { bucket: state.keyWindow, key: licenseHash, limit: env.keyLimit, blockedBy: "license" },
+    { bucket: state.fpWindow, key: fpHash, limit: env.fpLimit, blockedBy: "fingerprint" },
+  ]);
+  if (blocked) return blocked;
 
   return forwardKeygenRequest({
     req,
@@ -368,12 +380,11 @@ async function proxyValidationRequest(
     start,
     url,
     buildHeaders: (upstreamUrl) => buildKeygenHeaders(req, upstreamUrl, env, { includeContentType: true }),
-    body,
-    bodyBytes: body.length,
+    body: Buffer.from(raw),
   });
 }
 
-export async function proxyKeygenApi(req: Request, env: AppEnv, state: AppState): Promise<Response> {
+export async function proxyKeygenApi(req: Request, env: AppEnv, state: AppState, server: Server<unknown>): Promise<Response> {
   const requestId = getRequestId(req);
   const url = new URL(req.url);
   const start = Date.now();
@@ -386,8 +397,8 @@ export async function proxyKeygenApi(req: Request, env: AppEnv, state: AppState)
   }
 
   if (isEntitlementsProxy) {
-    return proxyEntitlementsRequest(req, env, state, url, requestId, start);
+    return proxyEntitlementsRequest(req, env, state, server, url, requestId, start);
   }
 
-  return proxyValidationRequest(req, env, state, url, requestId, start);
+  return proxyValidationRequest(req, env, state, server, url, requestId, start);
 }

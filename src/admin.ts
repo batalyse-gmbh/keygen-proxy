@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { AppEnv } from "./config";
 import { getRequestId, json, readJsonSafe } from "./http";
 import { log } from "./logging";
-import type { AppState, ExpandedTargets } from "./rate-limits";
+import type { AppState, ExpandedTargets, ResetSeed } from "./rate-limits";
 import {
   deleteKeys,
   dropAssociationsMatching,
@@ -106,11 +106,12 @@ export async function resetRateLimits(req: Request, env: AppEnv, state: AppState
   const now = Date.now();
   pruneExpiredAssociations(state, now);
 
-  const expanded: ExpandedTargets = expandResetTargets(state.associations, {
+  const seed: ResetSeed = {
     ip: payload.ip,
-    licenseHash: licenseHash || undefined,
-    fpHash: fingerprintHash || undefined,
-  });
+    licenseHash,
+    fpHash: fingerprintHash,
+  };
+  const expanded: ExpandedTargets = expandResetTargets(state.associations, seed);
 
   const ipKeys: string[] = [];
   for (const ip of expanded.ips) {
@@ -127,7 +128,7 @@ export async function resetRateLimits(req: Request, env: AppEnv, state: AppState
     fingerprint: deleteKeys(state.fpWindow, [...expanded.fpHashes]),
   };
 
-  dropAssociationsMatching(state, expanded);
+  dropAssociationsMatching(state, seed);
 
   log(env, "info", "rate_limits.reset", {
     requestId,

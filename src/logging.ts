@@ -7,12 +7,8 @@ const logLevelRank: Record<LogLevel, number> = {
   error: 40,
 };
 
-export function safeLogLevel(value: LogLevel): LogLevel {
-  return value in logLevelRank ? value : "info";
-}
-
 export function log(env: AppEnv, level: LogLevel, event: string, fields: Record<string, unknown> = {}) {
-  if (logLevelRank[level] < logLevelRank[safeLogLevel(env.logLevel)]) {
+  if (logLevelRank[level] < logLevelRank[env.logLevel]) {
     return;
   }
 

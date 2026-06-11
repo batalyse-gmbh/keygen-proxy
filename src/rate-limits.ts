@@ -34,13 +34,38 @@ export function maxWindowMs(env: { ipLimit: { windowMs: number }; keyLimit: { wi
   return Math.max(env.ipLimit.windowMs, env.keyLimit.windowMs, env.fpLimit.windowMs);
 }
 
+const sweepEveryNRecords = 1_000;
+const maxAssociations = 100_000;
+let recordsSinceSweep = 0;
+
 export function recordAssociation(state: AppState, association: RequestAssociation): void {
+  recordsSinceSweep += 1;
+  if (recordsSinceSweep >= sweepEveryNRecords) {
+    recordsSinceSweep = 0;
+    const now = Date.now();
+    pruneExpiredAssociations(state, now);
+    pruneExpiredWindows(state, now);
+  }
+
   state.associations.push(association);
+  if (state.associations.length > maxAssociations) {
+    state.associations.splice(0, state.associations.length - maxAssociations);
+  }
 }
 
 export function pruneExpiredAssociations(state: AppState, now: number): void {
   if (state.associations.length === 0) return;
   state.associations = state.associations.filter((a) => a.expiresAt > now);
+}
+
+export function pruneExpiredWindows(state: AppState, now: number): void {
+  for (const bucket of [state.ipWindow, state.keyWindow, state.fpWindow]) {
+    for (const [key, window] of bucket) {
+      if (window.resetAt <= now) {
+        bucket.delete(key);
+      }
+    }
+  }
 }
 
 export type ResetSeed = {
@@ -55,6 +80,14 @@ export type ExpandedTargets = {
   fpHashes: Set<string>;
 };
 
+function matchesSeed(association: RequestAssociation, seed: ResetSeed): boolean {
+  return (
+    (seed.ip !== undefined && association.ip === seed.ip) ||
+    (seed.licenseHash !== undefined && association.licenseHash === seed.licenseHash) ||
+    (seed.fpHash !== undefined && association.fpHash === seed.fpHash)
+  );
+}
+
 export function expandResetTargets(associations: RequestAssociation[], seed: ResetSeed): ExpandedTargets {
   const ips = new Set<string>();
   const licenseHashes = new Set<string>();
@@ -65,11 +98,7 @@ export function expandResetTargets(associations: RequestAssociation[], seed: Res
   if (seed.fpHash) fpHashes.add(seed.fpHash);
 
   for (const a of associations) {
-    const matches =
-      (seed.ip !== undefined && a.ip === seed.ip) ||
-      (seed.licenseHash !== undefined && a.licenseHash === seed.licenseHash) ||
-      (seed.fpHash !== undefined && a.fpHash === seed.fpHash);
-    if (!matches) continue;
+    if (!matchesSeed(a, seed)) continue;
     ips.add(a.ip);
     licenseHashes.add(a.licenseHash);
     if (a.fpHash !== undefined) fpHashes.add(a.fpHash);
@@ -78,12 +107,12 @@ export function expandResetTargets(associations: RequestAssociation[], seed: Res
   return { ips, licenseHashes, fpHashes };
 }
 
-export function dropAssociationsMatching(state: AppState, expanded: ExpandedTargets): void {
+export function dropAssociationsMatching(state: AppState, seed: ResetSeed): void {
   if (state.associations.length === 0) return;
-  state.associations = state.associations.filter(
-    (a) =>
-      !expanded.ips.has(a.ip) && !expanded.licenseHashes.has(a.licenseHash) && !(a.fpHash !== undefined && expanded.fpHashes.has(a.fpHash)),
-  );
+  // Drop only associations that matched the reset seed directly; associations
+  // expanded one hop away still reference live (un-reset) windows and must
+  // remain available for future resets.
+  state.associations = state.associations.filter((a) => !matchesSeed(a, seed));
 }
 
 export function deleteKeys(bucket: Map<string, RateWindow>, keys: string[]): number {
